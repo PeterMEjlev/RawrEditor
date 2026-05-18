@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Lean fork of RAWR's Rawr.Raw. Only the pieces the editor needs to turn a
+       RAW file into a Rawr.Raw.LinearRawImage. Namespace + type identity are kept
+       identical to the culling app's Rawr.Raw so the develop engine can later be
+       merged into RAWR and run against its existing LibRawExtractor output. -->
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+</Project>

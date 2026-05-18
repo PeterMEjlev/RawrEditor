@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The develop engine. UI-agnostic apart from producing a WPF BitmapSource
+       (RAWR is also WPF, so this stays drop-in on merge). Depends only on
+       Rawr.Raw — give RAWR a reference to this project and a Develop panel and
+       the whole pipeline lights up against its existing LinearRawImage. -->
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Rawr.Raw\Rawr.Raw.csproj" />
+  </ItemGroup>
+
+</Project>

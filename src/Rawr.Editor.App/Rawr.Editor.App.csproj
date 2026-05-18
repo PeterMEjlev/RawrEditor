@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>RAWR.Editor</AssemblyName>
+    <RootNamespace>Rawr.Editor.App</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- LibRaw native DLLs + dependencies. Link strips the "native\" prefix so
+         they land flat next to RAWR.Editor.exe — P/Invoke (LibRawInterop) looks
+         next to the executable, not in subdirectories. Same convention as RAWR. -->
+    <Content Include="native\*.dll">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Rawr.Raw\Rawr.Raw.csproj" />
+    <ProjectReference Include="..\Rawr.Develop\Rawr.Develop.csproj" />
+  </ItemGroup>
+
+</Project>

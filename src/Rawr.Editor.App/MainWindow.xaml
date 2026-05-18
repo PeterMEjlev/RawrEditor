@@ -1,0 +1,134 @@
+<Window x:Class="Rawr.Editor.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:Rawr.Editor.App.ViewModels"
+        xmlns:ctl="clr-namespace:Rawr.Editor.App.Controls"
+        Title="RAWR Editor — Develop"
+        Height="860" Width="1340"
+        WindowStartupLocation="CenterScreen">
+
+    <Window.DataContext>
+        <vm:MainViewModel />
+    </Window.DataContext>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- ── Toolbar ── -->
+        <Border Grid.Row="0"
+                Background="{StaticResource BgToolbarBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,0,0,1"
+                Padding="10,8">
+            <DockPanel LastChildFill="False">
+                <Button DockPanel.Dock="Left" Content="📂  Open RAW…"
+                        Command="{Binding OpenCommand}" Margin="0,0,8,0" />
+                <Button DockPanel.Dock="Left" Content="↺  Reset"
+                        Command="{Binding ResetCommand}" Margin="0,0,8,0"
+                        IsEnabled="{Binding HasPhoto}" />
+                <Button DockPanel.Dock="Right" Content="⤓  Export JPEG…"
+                        Style="{StaticResource AccentButton}"
+                        Command="{Binding ExportCommand}"
+                        IsEnabled="{Binding HasPhoto}" />
+                <TextBlock DockPanel.Dock="Left"
+                           Text="{Binding FileName}"
+                           Foreground="{StaticResource TextDimBrush}"
+                           VerticalAlignment="Center" Margin="8,0,0,0" />
+            </DockPanel>
+        </Border>
+
+        <!-- ── Main: photo + adjustments ── -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="340" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Photo viewer -->
+            <Border Grid.Column="0" Background="#FF0C0D10" ClipToBounds="True">
+                <Grid>
+                    <Image Source="{Binding PreviewImage}"
+                           Stretch="Uniform"
+                           StretchDirection="Both"
+                           RenderOptions.BitmapScalingMode="HighQuality"
+                           Margin="16" />
+
+                    <TextBlock Text="Open a RAW photo to begin  (Open RAW…)"
+                               Foreground="{StaticResource TextDimBrush}"
+                               FontSize="15"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               Visibility="{Binding HasPhoto,
+                                   Converter={StaticResource InverseBoolVis}}" />
+
+                    <Border Background="#990C0D10"
+                            Visibility="{Binding IsBusy,
+                                Converter={StaticResource BoolVis}}">
+                        <TextBlock Text="{Binding StatusText}"
+                                   Foreground="{StaticResource TextBrush}"
+                                   FontSize="15"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center" />
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- Adjustments panel -->
+            <Border Grid.Column="1"
+                    Background="{StaticResource BgPanelBrush}"
+                    BorderBrush="{StaticResource BorderBrush}"
+                    BorderThickness="1,0,0,0">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled"
+                              Padding="14,16">
+                    <StackPanel>
+
+                        <Border Style="{StaticResource SectionCard}">
+                            <StackPanel>
+                                <TextBlock Text="WHITE BALANCE" Style="{StaticResource SectionCardHeader}" />
+                                <ctl:AdjustmentRow Label="Temp"  Value="{Binding Temperature, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Tint"  Value="{Binding Tint, Mode=TwoWay}" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource SectionCard}">
+                            <StackPanel>
+                                <TextBlock Text="TONE" Style="{StaticResource SectionCardHeader}" />
+                                <ctl:AdjustmentRow Label="Exposure" Value="{Binding Exposure, Mode=TwoWay}"
+                                                   Minimum="-5" Maximum="5" Step="0.05" />
+                                <ctl:AdjustmentRow Label="Contrast"   Value="{Binding Contrast, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Highlights" Value="{Binding Highlights, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Shadows"    Value="{Binding Shadows, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Whites"     Value="{Binding Whites, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Blacks"     Value="{Binding Blacks, Mode=TwoWay}" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource SectionCard}">
+                            <StackPanel>
+                                <TextBlock Text="PRESENCE" Style="{StaticResource SectionCardHeader}" />
+                                <ctl:AdjustmentRow Label="Vibrance"   Value="{Binding Vibrance, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Saturation" Value="{Binding Saturation, Mode=TwoWay}" />
+                            </StackPanel>
+                        </Border>
+
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+
+        <!-- ── Status bar ── -->
+        <Border Grid.Row="2"
+                Background="{StaticResource BgToolbarBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,1,0,0"
+                Padding="10,5">
+            <TextBlock Text="{Binding StatusText}"
+                       Foreground="{StaticResource TextDimBrush}" />
+        </Border>
+    </Grid>
+</Window>
