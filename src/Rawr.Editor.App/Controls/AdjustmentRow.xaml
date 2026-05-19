@@ -11,7 +11,7 @@
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="78" />
             <ColumnDefinition Width="*" />
-            <ColumnDefinition Width="44" />
+            <ColumnDefinition Width="50" />
             <ColumnDefinition Width="40" />
         </Grid.ColumnDefinitions>
 
@@ -32,11 +32,25 @@
                 Margin="8,0"
                 ToolTip="Double-click to reset" />
 
-        <TextBlock Grid.Column="2"
-                   Text="{Binding Value, ElementName=Root, StringFormat={}{0:0.##}}"
-                   HorizontalAlignment="Right"
-                   VerticalAlignment="Center"
-                   FontFamily="Consolas" />
+        <TextBox Grid.Column="2"
+                 x:Name="PART_ValueBox"
+                 Height="22"
+                 Padding="3,0"
+                 HorizontalAlignment="Stretch"
+                 VerticalAlignment="Center"
+                 HorizontalContentAlignment="Right"
+                 VerticalContentAlignment="Center"
+                 FontFamily="Consolas"
+                 Background="{StaticResource BgControlBrush}"
+                 Foreground="{StaticResource TextBrush}"
+                 BorderBrush="{StaticResource BorderBrush}"
+                 BorderThickness="1"
+                 CaretBrush="{StaticResource TextBrush}"
+                 GotKeyboardFocus="OnValueBoxGotKeyboardFocus"
+                 LostKeyboardFocus="OnValueBoxLostKeyboardFocus"
+                 PreviewKeyDown="OnValueBoxPreviewKeyDown"
+                 PreviewMouseLeftButtonDown="OnValueBoxPreviewMouseLeftButtonDown"
+                 ToolTip="Type a value and press Enter" />
 
         <!-- Math-version cycle button. Hidden (not collapsed) on rows without
              multiple versions so the reserved column still holds layout. Click

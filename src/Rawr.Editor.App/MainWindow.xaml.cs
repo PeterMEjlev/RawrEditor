@@ -124,6 +124,13 @@ public partial class MainWindow : Window
 
     private void OnFitClick(object sender, RoutedEventArgs e) => FitToViewport();
 
+    private void OnCalibrationButtonClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button || button.ContextMenu is null) return;
+        button.ContextMenu.PlacementTarget = button;
+        button.ContextMenu.IsOpen = true;
+    }
+
     private void OnOneToOneClick(object sender, RoutedEventArgs e)
     {
         // "100%" = one buffer pixel per screen pixel. Stretch=Uniform's fit

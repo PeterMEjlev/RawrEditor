@@ -35,6 +35,7 @@ public sealed class DevelopSettings
     // — Reset() leaves them alone, and at slider=0 every version is identity so
     // the version choice has no visible effect.
     public int ContrastVersion { get; set; } = 1;
+    public int HighlightsVersion { get; set; } = BasicTone.HighlightsVersionCount;
     public int ShadowsVersion { get; set; } = 1;
     public int WhitesVersion { get; set; } = 1;
     public int BlacksVersion { get; set; } = 1;

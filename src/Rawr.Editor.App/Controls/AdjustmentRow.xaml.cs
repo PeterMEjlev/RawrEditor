@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -19,7 +20,11 @@ public partial class AdjustmentRow : UserControl
     {
         InitializeComponent();
         PART_Slider.MouseDoubleClick += (_, _) => Value = 0;
-        Loaded += (_, _) => UpdateFill();
+        Loaded += (_, _) =>
+        {
+            UpdateFill();
+            UpdateValueText(force: true);
+        };
     }
 
     public static readonly DependencyProperty LabelProperty =
@@ -29,15 +34,17 @@ public partial class AdjustmentRow : UserControl
     public static readonly DependencyProperty ValueProperty =
         DependencyProperty.Register(nameof(Value), typeof(double), typeof(AdjustmentRow),
             new FrameworkPropertyMetadata(0.0,
-                FrameworkPropertyMetadataOptions.BindsTwoWayByDefault, OnValueChanged));
+                FrameworkPropertyMetadataOptions.BindsTwoWayByDefault,
+                OnValueChanged,
+                CoerceValue));
 
     public static readonly DependencyProperty MinimumProperty =
         DependencyProperty.Register(nameof(Minimum), typeof(double), typeof(AdjustmentRow),
-            new PropertyMetadata(-100.0));
+            new PropertyMetadata(-100.0, OnRangeChanged));
 
     public static readonly DependencyProperty MaximumProperty =
         DependencyProperty.Register(nameof(Maximum), typeof(double), typeof(AdjustmentRow),
-            new PropertyMetadata(100.0));
+            new PropertyMetadata(100.0, OnRangeChanged));
 
     public static readonly DependencyProperty StepProperty =
         DependencyProperty.Register(nameof(Step), typeof(double), typeof(AdjustmentRow),
@@ -65,7 +72,30 @@ public partial class AdjustmentRow : UserControl
     public bool HasVersions { get => (bool)GetValue(HasVersionsProperty); private set => SetValue(HasVersionsProperty, value); }
 
     private static void OnValueChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
-        => ((AdjustmentRow)d).UpdateFill();
+    {
+        var row = (AdjustmentRow)d;
+        row.UpdateFill();
+        row.UpdateValueText();
+    }
+
+    private static object CoerceValue(DependencyObject d, object baseValue)
+    {
+        var row = (AdjustmentRow)d;
+        double value = (double)baseValue;
+        if (!double.IsFinite(value)) return row.Value;
+
+        double min = Math.Min(row.Minimum, row.Maximum);
+        double max = Math.Max(row.Minimum, row.Maximum);
+        return Math.Clamp(value, min, max);
+    }
+
+    private static void OnRangeChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        var row = (AdjustmentRow)d;
+        row.CoerceValue(ValueProperty);
+        row.UpdateFill();
+        row.UpdateValueText();
+    }
 
     private static void OnVersionCountChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         => ((AdjustmentRow)d).HasVersions = ((AdjustmentRow)d).VersionCount > 1;
@@ -76,6 +106,59 @@ public partial class AdjustmentRow : UserControl
         double v = Value;
         PART_Slider.SelectionStart = Math.Min(0, v);
         PART_Slider.SelectionEnd = Math.Max(0, v);
+    }
+
+    private void UpdateValueText(bool force = false)
+    {
+        if (!force && PART_ValueBox.IsKeyboardFocusWithin) return;
+        PART_ValueBox.Text = Value.ToString("0.##", CultureInfo.CurrentCulture);
+    }
+
+    private void CommitValueText()
+    {
+        if (TryParseValue(PART_ValueBox.Text, out double typedValue))
+            Value = typedValue;
+
+        UpdateValueText(force: true);
+    }
+
+    private static bool TryParseValue(string text, out double value)
+    {
+        text = text.Trim();
+        bool parsed = double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out value)
+            || double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+
+        return parsed && double.IsFinite(value);
+    }
+
+    private void OnValueBoxGotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+        => PART_ValueBox.SelectAll();
+
+    private void OnValueBoxLostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+        => CommitValueText();
+
+    private void OnValueBoxPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            CommitValueText();
+            Keyboard.ClearFocus();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Escape)
+        {
+            UpdateValueText(force: true);
+            Keyboard.ClearFocus();
+            e.Handled = true;
+        }
+    }
+
+    private void OnValueBoxPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (PART_ValueBox.IsKeyboardFocusWithin) return;
+
+        PART_ValueBox.Focus();
+        e.Handled = true;
     }
 
     // Cycle 1 → 2 → … → N → 1.
