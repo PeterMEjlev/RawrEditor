@@ -29,6 +29,8 @@ public sealed partial class MainViewModel : ObservableObject
     private LinearRawImage? _preview;   // downsampled, drives realtime editing
     private string? _rawPath;
     private bool _suppressRender;
+    private BitmapSource? _neutralPreview;   // cached unedited render; powers the Before view
+    private BitmapSource? _currentRender;    // latest edited render; what After shows
 
     public MainViewModel()
     {
@@ -45,6 +47,23 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _statusText = "";
     [ObservableProperty] private bool _isBusy;
     [ObservableProperty] private bool _hasPhoto;
+    [ObservableProperty] private bool _isShowingBefore;
+
+    partial void OnIsShowingBeforeChanged(bool value)
+    {
+        if (!HasPhoto) return;
+        PreviewImage = value ? _neutralPreview : _currentRender;
+        StatusText = value
+            ? "Showing BEFORE — toggle off to return to your edits."
+            : $"{FileName} — edits apply live";
+    }
+
+    [RelayCommand]
+    private void ToggleBefore()
+    {
+        if (!HasPhoto) return;
+        IsShowingBefore = !IsShowingBefore;
+    }
 
     // ── Adjustments (neutral = 0) ──
     [ObservableProperty] private double _temperature;
@@ -58,11 +77,29 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private double _vibrance;
     [ObservableProperty] private double _saturation;
 
+    // ── Math-version selectors (default v1 = original RAWR math) ──
+    // Wired to the inline "v1/v2/…" button on each AdjustmentRow. Changing one
+    // re-renders the preview just like a slider move.
+    [ObservableProperty] private int _contrastVersion = 1;
+    [ObservableProperty] private int _shadowsVersion = 1;
+    [ObservableProperty] private int _whitesVersion = 1;
+    [ObservableProperty] private int _blacksVersion = 1;
+
+    // Exposed for the XAML so the cycle button knows how many versions exist.
+    // When a new vN is added in BasicTone, bumping the matching VersionCount
+    // there is enough — this property just surfaces the value.
+    public int ContrastVersionCount => BasicTone.ContrastVersionCount;
+    public int ShadowsVersionCount  => BasicTone.ShadowsVersionCount;
+    public int WhitesVersionCount   => BasicTone.WhitesVersionCount;
+    public int BlacksVersionCount   => BasicTone.BlacksVersionCount;
+
     private static readonly HashSet<string> AdjustmentNames = new()
     {
         nameof(Temperature), nameof(Tint), nameof(Exposure), nameof(Contrast),
         nameof(Highlights), nameof(Shadows), nameof(Whites), nameof(Blacks),
-        nameof(Vibrance), nameof(Saturation)
+        nameof(Vibrance), nameof(Saturation),
+        nameof(ContrastVersion), nameof(ShadowsVersion),
+        nameof(WhitesVersion), nameof(BlacksVersion)
     };
 
     // Any adjustment change schedules a debounced re-render.
@@ -85,6 +122,10 @@ public sealed partial class MainViewModel : ObservableObject
         Blacks = Blacks,
         Vibrance = Vibrance,
         Saturation = Saturation,
+        ContrastVersion = ContrastVersion,
+        ShadowsVersion = ShadowsVersion,
+        WhitesVersion = WhitesVersion,
+        BlacksVersion = BlacksVersion,
     };
 
     private void ScheduleRender()
@@ -113,7 +154,10 @@ public sealed partial class MainViewModel : ObservableObject
                 if (!ct.IsCancellationRequested)
                     Application.Current.Dispatcher.Invoke(() =>
                     {
-                        if (!ct.IsCancellationRequested) PreviewImage = bmp;
+                        if (ct.IsCancellationRequested) return;
+                        _currentRender = bmp;
+                        // Hold the Before view if it's currently shown; otherwise swap in the fresh edit.
+                        if (!IsShowingBefore) PreviewImage = bmp;
                     });
             }
             catch (OperationCanceledException) { /* superseded by a newer edit */ }
@@ -161,15 +205,25 @@ public sealed partial class MainViewModel : ObservableObject
 
         _rawPath = path;
         _preview = preview;
-        HasPhoto = true;
 
+        // Reset adjustments and the Before toggle *before* flipping HasPhoto so the
+        // OnIsShowingBeforeChanged hook (gated on HasPhoto) can't fire with stale buffers
+        // from the previously loaded image.
         _suppressRender = true;
         ResetAdjustments();
+        IsShowingBefore = false;
         _suppressRender = false;
+        HasPhoto = true;
+
+        // Render the neutral baseline once and keep it as the Before snapshot.
+        // This is also the initial After since all sliders sit at 0.
+        var neutralBmp = await Task.Run(() => DevelopProcessor.Render(preview, new DevelopSettings()));
+        _neutralPreview = neutralBmp;
+        _currentRender = neutralBmp;
+        PreviewImage = neutralBmp;
 
         IsBusy = false;
         StatusText = $"{FileName} — {preview.Width}×{preview.Height} preview · edits apply live";
-        RenderPreview();
     }
 
     [RelayCommand]

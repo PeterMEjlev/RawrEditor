@@ -11,6 +11,12 @@
         <vm:MainViewModel />
     </Window.DataContext>
 
+    <Window.InputBindings>
+        <!-- \ toggles Before/After like Lightroom. -->
+        <KeyBinding Key="OemPipe" Command="{Binding ToggleBeforeCommand}" />
+        <KeyBinding Key="OemBackslash" Command="{Binding ToggleBeforeCommand}" />
+    </Window.InputBindings>
+
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -29,15 +35,44 @@
                         Command="{Binding OpenCommand}" Margin="0,0,8,0" />
                 <Button DockPanel.Dock="Left" Content="↺  Reset"
                         Command="{Binding ResetCommand}" Margin="0,0,8,0"
-                        IsEnabled="{Binding HasPhoto}" />
-                <Button DockPanel.Dock="Right" Content="⤓  Export JPEG…"
-                        Style="{StaticResource AccentButton}"
-                        Command="{Binding ExportCommand}"
-                        IsEnabled="{Binding HasPhoto}" />
+                        IsEnabled="{Binding HasPhoto}"
+                        ToolTip="Reset every slider to its default" />
                 <TextBlock DockPanel.Dock="Left"
                            Text="{Binding FileName}"
                            Foreground="{StaticResource TextDimBrush}"
                            VerticalAlignment="Center" Margin="8,0,0,0" />
+
+                <!-- View controls cluster (Export is rightmost). -->
+                <Button DockPanel.Dock="Right" Content="⤓  Export JPEG…"
+                        Style="{StaticResource AccentButton}"
+                        Command="{Binding ExportCommand}"
+                        IsEnabled="{Binding HasPhoto}" />
+                <TextBlock DockPanel.Dock="Right"
+                           x:Name="ZoomLabel"
+                           Text="Fit"
+                           Foreground="{StaticResource TextDimBrush}"
+                           VerticalAlignment="Center"
+                           MinWidth="48"
+                           TextAlignment="Right"
+                           Margin="8,0,12,0" />
+                <Button DockPanel.Dock="Right" Content="100%"
+                        x:Name="OneToOneButton"
+                        Click="OnOneToOneClick"
+                        IsEnabled="{Binding HasPhoto}"
+                        Margin="0,0,4,0"
+                        ToolTip="Show the preview at 1 buffer pixel per screen pixel" />
+                <Button DockPanel.Dock="Right" Content="Fit"
+                        x:Name="FitButton"
+                        Click="OnFitClick"
+                        IsEnabled="{Binding HasPhoto}"
+                        Margin="0,0,4,0"
+                        ToolTip="Fit the photo to the viewer" />
+                <ToggleButton DockPanel.Dock="Right" Content="⇄  Before"
+                              Style="{StaticResource ToolbarToggleButton}"
+                              IsChecked="{Binding IsShowingBefore, Mode=TwoWay}"
+                              IsEnabled="{Binding HasPhoto}"
+                              Margin="0,0,12,0"
+                              ToolTip="Hide edits and show the unedited photo  (\)" />
             </DockPanel>
         </Border>
 
@@ -48,24 +83,45 @@
                 <ColumnDefinition Width="340" />
             </Grid.ColumnDefinitions>
 
-            <!-- Photo viewer -->
+            <!-- Photo viewer. The Image is transformed via MatrixTransform so
+                 the viewport can zoom (mouse wheel) and pan (drag) without
+                 forcing WPF to re-layout on every interaction. -->
             <Border Grid.Column="0" Background="#FF0C0D10" ClipToBounds="True">
-                <Grid>
-                    <Image Source="{Binding PreviewImage}"
+                <Grid x:Name="ViewerHost"
+                      Background="Transparent"
+                      ClipToBounds="True"
+                      Focusable="True"
+                      MouseWheel="OnViewerMouseWheel"
+                      MouseLeftButtonDown="OnViewerMouseLeftButtonDown"
+                      MouseLeftButtonUp="OnViewerMouseLeftButtonUp"
+                      MouseMove="OnViewerMouseMove"
+                      SizeChanged="OnViewerSizeChanged">
+                    <Image x:Name="ViewerImage"
+                           Source="{Binding PreviewImage}"
                            Stretch="Uniform"
                            StretchDirection="Both"
                            RenderOptions.BitmapScalingMode="HighQuality"
-                           Margin="16" />
+                           RenderTransformOrigin="0.5,0.5"
+                           IsHitTestVisible="False">
+                        <Image.RenderTransform>
+                            <TransformGroup>
+                                <ScaleTransform x:Name="ViewerScale" ScaleX="1" ScaleY="1" />
+                                <TranslateTransform x:Name="ViewerTranslate" X="0" Y="0" />
+                            </TransformGroup>
+                        </Image.RenderTransform>
+                    </Image>
 
                     <TextBlock Text="Open a RAW photo to begin  (Open RAW…)"
                                Foreground="{StaticResource TextDimBrush}"
                                FontSize="15"
                                HorizontalAlignment="Center"
                                VerticalAlignment="Center"
+                               IsHitTestVisible="False"
                                Visibility="{Binding HasPhoto,
                                    Converter={StaticResource InverseBoolVis}}" />
 
                     <Border Background="#990C0D10"
+                            IsHitTestVisible="False"
                             Visibility="{Binding IsBusy,
                                 Converter={StaticResource BoolVis}}">
                         <TextBlock Text="{Binding StatusText}"
@@ -100,11 +156,19 @@
                                 <TextBlock Text="TONE" Style="{StaticResource SectionCardHeader}" />
                                 <ctl:AdjustmentRow Label="Exposure" Value="{Binding Exposure, Mode=TwoWay}"
                                                    Minimum="-5" Maximum="5" Step="0.05" />
-                                <ctl:AdjustmentRow Label="Contrast"   Value="{Binding Contrast, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Contrast"   Value="{Binding Contrast, Mode=TwoWay}"
+                                                   Version="{Binding ContrastVersion, Mode=TwoWay}"
+                                                   VersionCount="{Binding ContrastVersionCount, Mode=OneTime}" />
                                 <ctl:AdjustmentRow Label="Highlights" Value="{Binding Highlights, Mode=TwoWay}" />
-                                <ctl:AdjustmentRow Label="Shadows"    Value="{Binding Shadows, Mode=TwoWay}" />
-                                <ctl:AdjustmentRow Label="Whites"     Value="{Binding Whites, Mode=TwoWay}" />
-                                <ctl:AdjustmentRow Label="Blacks"     Value="{Binding Blacks, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Shadows"    Value="{Binding Shadows, Mode=TwoWay}"
+                                                   Version="{Binding ShadowsVersion, Mode=TwoWay}"
+                                                   VersionCount="{Binding ShadowsVersionCount, Mode=OneTime}" />
+                                <ctl:AdjustmentRow Label="Whites"     Value="{Binding Whites, Mode=TwoWay}"
+                                                   Version="{Binding WhitesVersion, Mode=TwoWay}"
+                                                   VersionCount="{Binding WhitesVersionCount, Mode=OneTime}" />
+                                <ctl:AdjustmentRow Label="Blacks"     Value="{Binding Blacks, Mode=TwoWay}"
+                                                   Version="{Binding BlacksVersion, Mode=TwoWay}"
+                                                   VersionCount="{Binding BlacksVersionCount, Mode=OneTime}" />
                             </StackPanel>
                         </Border>
 

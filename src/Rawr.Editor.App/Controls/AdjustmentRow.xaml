@@ -4,10 +4,15 @@
              x:Name="Root"
              Margin="0,5">
     <Grid>
+        <!-- Column 3 is always reserved for the version pill, even on rows
+             that don't have versions (Exposure, Highlights). That way every
+             slider in the panel lines up at the same right edge regardless
+             of which rows happen to expose a v1/v2/… toggle. -->
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="78" />
             <ColumnDefinition Width="*" />
             <ColumnDefinition Width="44" />
+            <ColumnDefinition Width="40" />
         </Grid.ColumnDefinitions>
 
         <TextBlock Grid.Column="0"
@@ -32,5 +37,23 @@
                    HorizontalAlignment="Right"
                    VerticalAlignment="Center"
                    FontFamily="Consolas" />
+
+        <!-- Math-version cycle button. Hidden (not collapsed) on rows without
+             multiple versions so the reserved column still holds layout. Click
+             advances 1→2→…→N→1. ContentStringFormat is used instead of the
+             binding's StringFormat because Button.Content is typed `object`,
+             and StringFormat on object-typed bindings is unreliable. -->
+        <Button Grid.Column="3"
+                x:Name="PART_VersionButton"
+                Content="{Binding Version, ElementName=Root}"
+                ContentStringFormat="v{0}"
+                Click="OnVersionClick"
+                HorizontalAlignment="Stretch"
+                Padding="0,1"
+                Margin="6,0,0,0"
+                FontSize="11"
+                Visibility="{Binding HasVersions, ElementName=Root,
+                                     Converter={StaticResource HiddenVis}}"
+                ToolTip="Click to cycle through math versions for this slider" />
     </Grid>
 </UserControl>

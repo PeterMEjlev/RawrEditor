@@ -11,6 +11,7 @@
 
             <conv:BoolToVisibilityConverter x:Key="BoolVis" />
             <conv:BoolToVisibilityConverter x:Key="InverseBoolVis" Invert="True" />
+            <conv:BoolToVisibilityConverter x:Key="HiddenVis" UseHidden="True" />
         </ResourceDictionary>
     </Application.Resources>
 </Application>

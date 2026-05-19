@@ -29,6 +29,16 @@ public sealed class DevelopSettings
     public double Vibrance { get; set; }
     public double Saturation { get; set; }
 
+    // ── Math-version selectors (1 = RAWR original, 2 = darktable-inspired) ──
+    // These pick which formula in BasicTone the slider runs through so different
+    // models can be A/B-compared on the same photo. They are *not* slider values
+    // — Reset() leaves them alone, and at slider=0 every version is identity so
+    // the version choice has no visible effect.
+    public int ContrastVersion { get; set; } = 1;
+    public int ShadowsVersion { get; set; } = 1;
+    public int WhitesVersion { get; set; } = 1;
+    public int BlacksVersion { get; set; } = 1;
+
     public DevelopSettings Clone() => (DevelopSettings)MemberwiseClone();
 
     /// <summary>True when every slider is at its neutral default.</summary>

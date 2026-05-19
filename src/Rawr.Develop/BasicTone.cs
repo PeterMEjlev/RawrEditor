@@ -165,4 +165,200 @@ public static class BasicTone
 
         return p < 0.0 ? 0.0 : p > 1.0 ? 1.0 : p;
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //                         VERSIONED SLIDER MATH
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // Each non-trivial tone slider exposes a SwitchVersion(int, ...) dispatcher
+    // and per-version implementations. Version 1 is RAWR's original math (see
+    // the V1 helpers below — they apply the slider in isolation, equivalent to
+    // ApplyHighlightShadowContrast / endpoint remap when the other relevant
+    // sliders are zero). Version 2 is the darktable-style alternative model.
+    //
+    // To add a v3 of any slider:
+    //   1. Bump <Slider>VersionCount by one.
+    //   2. Add an ApplyXxxV3 method below.
+    //   3. Add a `case 3:` branch in the matching ApplyXxx dispatcher.
+    // The UI auto-discovers the new version count via the DevelopSettings
+    // helpers further down — no XAML changes needed.
+
+    public const int ContrastVersionCount   = 2;
+    public const int ShadowsVersionCount    = 2;
+    public const int WhitesVersionCount     = 2;
+    public const int BlacksVersionCount     = 2;
+
+    // ── V1 "alone" helpers ────────────────────────────────────────────────
+    // These run the v1 math for a single slider, used when another slider is
+    // on a different version so the combined ApplyHighlightShadowContrast /
+    // combined endpoint remap fast path no longer applies.
+
+    public static void ApplyHighlightsV1(ref double r, ref double g, ref double b, double highlights)
+    {
+        if (highlights == 0.0) return;
+        double y = Luminance(r, g, b);
+        if (y < LumaEps) return;
+        double ev = Math.Log2(y / MiddleGray);
+        double mask = SmoothStep(0.0, 3.0, ev);
+        double newEv = ev + highlights / 100.0 * HighlightStrength * mask;
+        double ratio = LumaFromEv(newEv) / y;
+        r *= ratio; g *= ratio; b *= ratio;
+    }
+
+    public static void ApplyShadowsV1(ref double r, ref double g, ref double b, double shadows)
+    {
+        if (shadows == 0.0) return;
+        double y = Luminance(r, g, b);
+        if (y < LumaEps) return;
+        double ev = Math.Log2(y / MiddleGray);
+        double mask = 1.0 - SmoothStep(-4.0, 0.0, ev);
+        double newEv = ev + shadows / 100.0 * ShadowStrength * mask;
+        double ratio = LumaFromEv(newEv) / y;
+        r *= ratio; g *= ratio; b *= ratio;
+    }
+
+    public static void ApplyContrastV1(ref double r, ref double g, ref double b, double contrastSlope)
+    {
+        if (contrastSlope == 1.0) return;
+        double y = Luminance(r, g, b);
+        if (y < LumaEps) return;
+        double ev = Math.Log2(y / MiddleGray);
+        double ratio = LumaFromEv(ev * contrastSlope) / y;
+        r *= ratio; g *= ratio; b *= ratio;
+    }
+
+    /// <summary>v1 Whites in isolation: endpoint remap with the black point fixed at 0 ⇒ lr / WhiteLin.</summary>
+    public static void ApplyWhitesV1(ref double r, ref double g, ref double b, double whites)
+    {
+        if (whites == 0.0) return;
+        double inv = 1.0 / WhiteLin(whites);
+        r *= inv; g *= inv; b *= inv;
+    }
+
+    /// <summary>v1 Blacks in isolation: endpoint remap with the white point fixed at 1 ⇒ (lr − BlackLin) / (1 − BlackLin).</summary>
+    public static void ApplyBlacksV1(ref double r, ref double g, ref double b, double blacks)
+    {
+        if (blacks == 0.0) return;
+        double bl = BlackLin(blacks);
+        double inv = 1.0 / (1.0 - bl);
+        r = (r - bl) * inv;
+        g = (g - bl) * inv;
+        b = (b - bl) * inv;
+    }
+
+    // ── V2 (darktable-inspired) ───────────────────────────────────────────
+
+    /// <summary>
+    /// Contrast v2: darktable's hue-preserving luminance power curve about
+    /// middle grey. Y_out = pivot · (Y_in / pivot)^(1 + slider·k). Pivot is
+    /// MiddleGray so middle grey is exactly a fixed point (matches v1).
+    /// </summary>
+    public const double ContrastV2Pivot = MiddleGray;
+    public const double ContrastV2Range = 0.6;
+    public static void ApplyContrastV2(ref double r, ref double g, ref double b, double contrast)
+    {
+        if (contrast == 0.0) return;
+        double y = Luminance(r, g, b);
+        if (y < LumaEps) return;
+        double exponent = 1.0 + (contrast / 100.0) * ContrastV2Range;
+        double y2 = ContrastV2Pivot * Math.Pow(y / ContrastV2Pivot, exponent);
+        double ratio = y2 / y;
+        r *= ratio; g *= ratio; b *= ratio;
+    }
+
+    /// <summary>
+    /// Shadows v2: tone-equalizer-style EV lift gated by a smoothstep on
+    /// luminance (full effect at y=0, zero by y=0.45). Positive opens shadows,
+    /// negative crushes them. Strength ±2 EV at slider extremes.
+    /// </summary>
+    public const double ShadowsV2Stops = 2.0;
+    public const double ShadowsV2MaskLo = 0.0;
+    public const double ShadowsV2MaskHi = 0.45;
+    public static void ApplyShadowsV2(ref double r, ref double g, ref double b, double shadows)
+    {
+        if (shadows == 0.0) return;
+        double y = Luminance(r, g, b);
+        if (y < LumaEps) return;
+        double mask = 1.0 - SmoothStep(ShadowsV2MaskLo, ShadowsV2MaskHi, y);
+        if (mask <= 0.0) return;
+        double gain = Math.Pow(2.0, (shadows / 100.0) * ShadowsV2Stops * mask);
+        r *= gain; g *= gain; b *= gain;
+    }
+
+    /// <summary>
+    /// Whites v2: smooth high-tone EV mask (no hard endpoint clip). Positive
+    /// pushes the brightest band toward clipping; negative protects highlights.
+    /// Mask ramps in over y=0.75..1.0, strength ±1.5 EV.
+    /// </summary>
+    public const double WhitesV2Stops = 1.5;
+    public const double WhitesV2MaskLo = 0.75;
+    public const double WhitesV2MaskHi = 1.0;
+    public static void ApplyWhitesV2(ref double r, ref double g, ref double b, double whites)
+    {
+        if (whites == 0.0) return;
+        double y = Luminance(r, g, b);
+        if (y < LumaEps) return;
+        double mask = SmoothStep(WhitesV2MaskLo, WhitesV2MaskHi, y);
+        if (mask <= 0.0) return;
+        double gain = Math.Pow(2.0, (whites / 100.0) * WhitesV2Stops * mask);
+        r *= gain; g *= gain; b *= gain;
+    }
+
+    /// <summary>
+    /// Blacks v2: smooth low-tone EV mask (no hard black-point shift).
+    /// Positive lifts the deepest band; negative crushes it. Mask falls from
+    /// y=0 (full) to y=0.35 (none), strength ±1.5 EV.
+    /// </summary>
+    public const double BlacksV2Stops = 1.5;
+    public const double BlacksV2MaskLo = 0.0;
+    public const double BlacksV2MaskHi = 0.35;
+    public static void ApplyBlacksV2(ref double r, ref double g, ref double b, double blacks)
+    {
+        if (blacks == 0.0) return;
+        double y = Luminance(r, g, b);
+        if (y < LumaEps) return;
+        double mask = 1.0 - SmoothStep(BlacksV2MaskLo, BlacksV2MaskHi, y);
+        if (mask <= 0.0) return;
+        double gain = Math.Pow(2.0, (blacks / 100.0) * BlacksV2Stops * mask);
+        r *= gain; g *= gain; b *= gain;
+    }
+
+    // ── Version dispatchers ──────────────────────────────────────────────
+
+    public static void ApplyContrast(int version, ref double r, ref double g, ref double b,
+                                     double contrast, double contrastSlope)
+    {
+        switch (version)
+        {
+            case 2: ApplyContrastV2(ref r, ref g, ref b, contrast); break;
+            default: ApplyContrastV1(ref r, ref g, ref b, contrastSlope); break;
+        }
+    }
+
+    public static void ApplyShadows(int version, ref double r, ref double g, ref double b, double shadows)
+    {
+        switch (version)
+        {
+            case 2: ApplyShadowsV2(ref r, ref g, ref b, shadows); break;
+            default: ApplyShadowsV1(ref r, ref g, ref b, shadows); break;
+        }
+    }
+
+    public static void ApplyWhites(int version, ref double r, ref double g, ref double b, double whites)
+    {
+        switch (version)
+        {
+            case 2: ApplyWhitesV2(ref r, ref g, ref b, whites); break;
+            default: ApplyWhitesV1(ref r, ref g, ref b, whites); break;
+        }
+    }
+
+    public static void ApplyBlacks(int version, ref double r, ref double g, ref double b, double blacks)
+    {
+        switch (version)
+        {
+            case 2: ApplyBlacksV2(ref r, ref g, ref b, blacks); break;
+            default: ApplyBlacksV1(ref r, ref g, ref b, blacks); break;
+        }
+    }
 }

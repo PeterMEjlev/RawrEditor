@@ -65,14 +65,33 @@ public static class DevelopProcessor
         // strengths are hoisted to per-render constants; at neutral every flag
         // is false so this is a true no-op and the render is byte-identical to
         // the original camera-matched look (which now lives wholly in the LUT).
+        //
+        // Per-slider Version selects which BasicTone formula runs. Version 1 is
+        // RAWR's original math; v2 is the darktable-inspired alternative. When
+        // every slider in a block is v1 we take the combined fast path (one
+        // luminance / log / pow per pixel for HSL; one (lr−bk)/span for ends)
+        // which is byte-identical to the original render. As soon as any v2
+        // appears the block falls back to per-slider passes.
         double hl = s.Highlights;
         double sh = s.Shadows;
-        double contrastSlope = BasicTone.ContrastSlope(s.Contrast);
-        double whiteLin = BasicTone.WhiteLin(s.Whites);
-        double blackLin = BasicTone.BlackLin(s.Blacks);
+        double co = s.Contrast;
+        double wh = s.Whites;
+        double bk = s.Blacks;
+        int contrastV  = s.ContrastVersion;
+        int shadowsV   = s.ShadowsVersion;
+        int whitesV    = s.WhitesVersion;
+        int blacksV    = s.BlacksVersion;
+        double contrastSlope = BasicTone.ContrastSlope(co);
+        double whiteLin = BasicTone.WhiteLin(wh);
+        double blackLin = BasicTone.BlackLin(bk);
         double invSpan = 1.0 / (whiteLin - blackLin);
-        bool doEv = s.Highlights != 0.0 || s.Shadows != 0.0 || s.Contrast != 0.0;
-        bool doEnds = s.Whites != 0.0 || s.Blacks != 0.0;
+        // Highlights only has v1 today, so the combined-HSL fast path needs
+        // only shadows+contrast to also be v1. Bump this check when a v2 of
+        // Highlights gets added.
+        bool combinedHsl  = shadowsV == 1 && contrastV == 1;
+        bool combinedEnds = whitesV == 1 && blacksV == 1;
+        bool doEv = hl != 0.0 || sh != 0.0 || co != 0.0;
+        bool doEnds = wh != 0.0 || bk != 0.0;
         const double inv65535 = 1.0 / 65535.0;
 
         // ── Display LUT: normalised linear → fractional 8-bit perceptual ──
@@ -99,14 +118,38 @@ public static class DevelopProcessor
                 double lb = src[srcIdx + 2] * gainB * inv65535;
 
                 if (doEv)
-                    BasicTone.ApplyHighlightShadowContrast(
-                        ref lr, ref lg, ref lb, hl, sh, contrastSlope);
+                {
+                    if (combinedHsl)
+                    {
+                        // Fast path: all of highlights/shadows/contrast on v1 ⇒
+                        // RAWR's original combined EV-space ratio. Byte-identical
+                        // to the pre-versioning render.
+                        BasicTone.ApplyHighlightShadowContrast(
+                            ref lr, ref lg, ref lb, hl, sh, contrastSlope);
+                    }
+                    else
+                    {
+                        // Mixed-version: per-slider passes, in pipeline order.
+                        if (hl != 0.0) BasicTone.ApplyHighlightsV1(ref lr, ref lg, ref lb, hl);
+                        if (sh != 0.0) BasicTone.ApplyShadows(shadowsV, ref lr, ref lg, ref lb, sh);
+                        if (co != 0.0) BasicTone.ApplyContrast(contrastV, ref lr, ref lg, ref lb, co, contrastSlope);
+                    }
+                }
 
                 if (doEnds)
                 {
-                    lr = (lr - blackLin) * invSpan;
-                    lg = (lg - blackLin) * invSpan;
-                    lb = (lb - blackLin) * invSpan;
+                    if (combinedEnds)
+                    {
+                        // Fast path: both endpoints on v1 ⇒ original combined remap.
+                        lr = (lr - blackLin) * invSpan;
+                        lg = (lg - blackLin) * invSpan;
+                        lb = (lb - blackLin) * invSpan;
+                    }
+                    else
+                    {
+                        if (wh != 0.0) BasicTone.ApplyWhites(whitesV, ref lr, ref lg, ref lb, wh);
+                        if (bk != 0.0) BasicTone.ApplyBlacks(blacksV, ref lr, ref lg, ref lb, bk);
+                    }
                 }
 
                 int ir = (int)(lr * 65535.0 + 0.5);
