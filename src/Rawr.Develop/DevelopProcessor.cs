@@ -8,23 +8,25 @@ namespace Rawr.Develop;
 /// Renders a <see cref="DevelopSettings"/> over a 16-bit linear <see cref="LinearRawImage"/>
 /// into a displayable BGR24 bitmap.
 ///
-/// This is RAWR's <c>ExposureProcessor.Render</c> generalised from "exposure only"
-/// to the full Basic panel. The architecture is unchanged because it was already
-/// the right one:
+/// This is RAWR's <c>ExposureProcessor.Render</c> generalised from "exposure
+/// only" to the full Basic panel, with the Lightroom-like tone model in
+/// <see cref="BasicTone"/>:
 ///
-///   1. White balance + exposure are per-channel <i>linear</i> gains, applied to
-///      the 16-bit sensor value before anything else. Clipping at 65535 is the
-///      real sensor ceiling — pulling exposure down recovers highlights that a
-///      baked JPEG would have lost.
-///   2. Everything that is a pure function of a single channel value (sRGB
-///      encode, the camera-match midtone lift, and the Whites/Blacks/Shadows/
-///      Highlights/Contrast tone curve) is baked once per render into a
-///      65536-entry float LUT. Per pixel it is three table lookups.
-///   3. Colour (Vibrance/Saturation) needs cross-channel work, so pixels are
+///   1. White balance + Exposure are per-channel <i>linear</i> gains applied
+///      to the sensor value (Exposure = 2^EV). Values are kept unclamped from
+///      here on so highlight detail above the old 65535 ceiling survives.
+///   2. Highlights / Shadows / Contrast run in scene-linear log-EV space as a
+///      single hue-preserving luminance ratio; Whites / Blacks then remap the
+///      linear endpoints. All five are no-ops at neutral.
+///   3. The display transform — sRGB encode, camera-match midtone lift, gentle
+///      base S — is a pure function of one channel value, baked once into a
+///      65536-entry float LUT (three lookups per pixel). At neutral the whole
+///      pipeline reduces to exactly this LUT, byte-identical to the original.
+///   4. Colour (Vibrance/Saturation) needs cross-channel work, so pixels are
 ///      decomposed into luma + Rec.709 chroma. The chroma planes get the same
 ///      small box blur RAWR uses to kill high-ISO colour speckle, then the
 ///      saturation/vibrance scale, then recompose.
-///   4. TPDF dither before the 8-bit round so the sRGB curve's compression of
+///   5. TPDF dither before the 8-bit round so the sRGB curve's compression of
 ///      the bright end doesn't band in skies and skin.
 ///
 /// Same input → same output regardless of core count (per-row deterministic RNG).
@@ -47,7 +49,7 @@ public static class DevelopProcessor
         var po = new ParallelOptions { CancellationToken = ct };
 
         // ── Per-channel linear gain: exposure × white balance ──
-        double expGain = Math.Pow(2.0, s.Exposure);
+        double expGain = BasicTone.ExposureGain(s.Exposure);
         double t = Math.Clamp(s.Temperature / 100.0, -1.0, 1.0);
         double ti = Math.Clamp(s.Tint / 100.0, -1.0, 1.0);
         // Warm (+T) lifts red, drops blue. Tint +/- trades green against magenta.
@@ -56,10 +58,29 @@ public static class DevelopProcessor
         double gainB = expGain * (1.0 - 0.45 * t);
         double gainG = expGain * (1.0 - 0.30 * ti);
 
-        // ── Tone LUT: 16-bit linear → fractional 8-bit perceptual ──
-        float[] lut = BuildToneLut(s);
+        // ── Highlights/Shadows/Contrast/Whites/Blacks: EV-space, linear ──
+        // These five run in scene-linear space *before* the display curve,
+        // exactly RAWR's recommended order (… → Exposure → Highlights/Shadows
+        // → Contrast → Whites/Blacks endpoints → output transform). All slider
+        // strengths are hoisted to per-render constants; at neutral every flag
+        // is false so this is a true no-op and the render is byte-identical to
+        // the original camera-matched look (which now lives wholly in the LUT).
+        double hl = s.Highlights;
+        double sh = s.Shadows;
+        double contrastSlope = BasicTone.ContrastSlope(s.Contrast);
+        double whiteLin = BasicTone.WhiteLin(s.Whites);
+        double blackLin = BasicTone.BlackLin(s.Blacks);
+        double invSpan = 1.0 / (whiteLin - blackLin);
+        bool doEv = s.Highlights != 0.0 || s.Shadows != 0.0 || s.Contrast != 0.0;
+        bool doEnds = s.Whites != 0.0 || s.Blacks != 0.0;
+        const double inv65535 = 1.0 / 65535.0;
 
-        // ── Pass 1: gain + clip + LUT, decompose to luma/chroma ──
+        // ── Display LUT: normalised linear → fractional 8-bit perceptual ──
+        // Pure camera-matched output transform (sRGB → midtone match → base
+        // S). No slider terms — those are the EV-space block above.
+        float[] lut = BuildDisplayLut();
+
+        // ── Pass 1: gain → EV tone → endpoints → LUT, decompose luma/chroma ──
         float[] luma = new float[n];
         float[] cb = new float[n]; // B − Y
         float[] cr = new float[n]; // R − Y
@@ -70,21 +91,39 @@ public static class DevelopProcessor
             int srcIdx = rowI * 3;
             for (int x = 0; x < w; x++)
             {
-                int r = (int)(src[srcIdx]     * gainR);
-                int g = (int)(src[srcIdx + 1] * gainG);
-                int b = (int)(src[srcIdx + 2] * gainB);
-                if (r > 65535) r = 65535; else if (r < 0) r = 0;
-                if (g > 65535) g = 65535; else if (g < 0) g = 0;
-                if (b > 65535) b = 65535; else if (b < 0) b = 0;
+                // Scene-linear, normalised so 1.0 = sensor saturation. Kept
+                // unclamped through the tone math so highlight detail above
+                // the old 65535 ceiling survives until Whites decides it.
+                double lr = src[srcIdx]     * gainR * inv65535;
+                double lg = src[srcIdx + 1] * gainG * inv65535;
+                double lb = src[srcIdx + 2] * gainB * inv65535;
 
-                float lr = lut[r];
-                float lg = lut[g];
-                float lb = lut[b];
-                float y = 0.2126f * lr + 0.7152f * lg + 0.0722f * lb;
+                if (doEv)
+                    BasicTone.ApplyHighlightShadowContrast(
+                        ref lr, ref lg, ref lb, hl, sh, contrastSlope);
+
+                if (doEnds)
+                {
+                    lr = (lr - blackLin) * invSpan;
+                    lg = (lg - blackLin) * invSpan;
+                    lb = (lb - blackLin) * invSpan;
+                }
+
+                int ir = (int)(lr * 65535.0 + 0.5);
+                int ig = (int)(lg * 65535.0 + 0.5);
+                int ib = (int)(lb * 65535.0 + 0.5);
+                if (ir < 0) ir = 0; else if (ir > 65535) ir = 65535;
+                if (ig < 0) ig = 0; else if (ig > 65535) ig = 65535;
+                if (ib < 0) ib = 0; else if (ib > 65535) ib = 65535;
+
+                float pr = lut[ir];
+                float pg = lut[ig];
+                float pb = lut[ib];
+                float y = 0.2126f * pr + 0.7152f * pg + 0.0722f * pb;
                 int i = rowI + x;
                 luma[i] = y;
-                cb[i] = lb - y;
-                cr[i] = lr - y;
+                cb[i] = pb - y;
+                cr[i] = pr - y;
                 srcIdx += 3;
             }
         });
@@ -169,109 +208,20 @@ public static class DevelopProcessor
     }
 
     /// <summary>
-    /// 65536-entry table: 16-bit linear value → fractional 8-bit perceptual
-    /// [0..255]. Bakes, in Lightroom-ish order: sRGB encode → camera-match
-    /// midtone lift → Blacks/Whites endpoints → Shadows/Highlights regional
-    /// lifts → Contrast S-curve. Fractional output is what makes the dither
-    /// resolve banding back into smooth gradient.
+    /// 65536-entry table: normalised-linear value → fractional 8-bit
+    /// perceptual [0..255], via <see cref="BasicTone.DisplayCurve"/> only
+    /// (sRGB encode → camera-match midtone lift → gentle base S-curve). The
+    /// slider tone work happens upstream in EV space, so this table is the
+    /// pure output transform and is independent of the settings — at neutral
+    /// the whole pipeline reduces to exactly this curve. Fractional output is
+    /// what lets the dither resolve banding back into smooth gradient.
     /// </summary>
-    private static float[] BuildToneLut(DevelopSettings s)
+    private static float[] BuildDisplayLut()
     {
-        // Slider → working strength. 0.70 base midtone lift matches RAWR's
-        // neutral preview (camera JPEGs lift midtones well above a pure sRGB
-        // encode); without it RAW previews look markedly darker than the JPG.
-        const double midtoneLift = 0.70;
-
-        double kBl = s.Blacks / 100.0;       // − crush / + lift the toe
-        double kW  = s.Whites / 100.0;       // − pull in / + extend the shoulder
-        double kSh = s.Shadows / 100.0;      // broad lower-mid lift
-        double kHl = s.Highlights / 100.0;   // broad upper-mid recover (−) / push (+)
-        double kC  = s.Contrast / 100.0;     // S-curve strength about mid-grey
-
-        // A light base S-curve is always present for the camera look; Contrast
-        // scales it up, or flattens toward linear when negative.
-        const double baseContrast = 0.18;
-        double contrastBlend = kC >= 0
-            ? baseContrast + (1.0 - baseContrast) * kC      // 0.18 → 1.0
-            : baseContrast * (1.0 + kC);                    // 0.18 → 0.0
-        const double tanhSlope = 2.0;
-        double tanhNorm = Math.Tanh(tanhSlope);
-
         var lut = new float[65536];
         for (int i = 0; i < 65536; i++)
-        {
-            double linear = i / 65535.0;
-
-            // 1. linear → sRGB
-            double srgb = linear <= 0.0031308
-                ? 12.92 * linear
-                : 1.055 * Math.Pow(linear, 1.0 / 2.4) - 0.055;
-
-            // 2. camera-match midtone lift
-            double p = Math.Pow(srgb, midtoneLift);
-
-            // 3. Blacks — toe, weight strongest at p=0, gone by ~p=0.5
-            double wBlk = Cube(1.0 - p);
-            p += kBl * 0.30 * wBlk;
-
-            // 4. Whites — shoulder, weight strongest at p=1
-            double wWht = Cube(p);
-            p += kW * 0.30 * wWht;
-
-            // 5. Shadows — broad lower-mid lift. Bell-shaped weight anchored at
-            // pure black: deep blacks stay black on +Shadows (no grey wash),
-            // peak effect lands in the actual shadow region (~p=0.20), fades
-            // by mid-grey. This is the Lightroom distinction vs Blacks: Blacks
-            // moves the endpoint, Shadows is a regional curve that preserves it.
-            p += kSh * 0.45 * ShadowsWeight(p);
-
-            // 6. Highlights — broad upper-mid; − recovers, + pushes. Anchored
-            // at pure white so spectral highlights aren't dragged to grey on
-            // recovery; peak lands at ~p=0.78, fades by mid-grey.
-            p += kHl * 0.45 * HighlightsWeight(p);
-
-            // 7. Contrast — tanh S about 0.5
-            if (contrastBlend > 0.0)
-            {
-                double tt = p * 2.0 - 1.0;
-                double sCurve = (Math.Tanh(tt * tanhSlope) / tanhNorm + 1.0) * 0.5;
-                p = p * (1.0 - contrastBlend) + sCurve * contrastBlend;
-            }
-
-            if (p < 0.0) p = 0.0; else if (p > 1.0) p = 1.0;
-            lut[i] = (float)(p * 255.0);
-        }
+            lut[i] = (float)(BasicTone.DisplayCurve(i / 65535.0) * 255.0);
         return lut;
-    }
-
-    private static double Cube(double v) => v <= 0 ? 0 : v >= 1 ? 1 : v * v * v;
-
-    /// <summary>
-    /// Bell weight for the Shadows region: 0 at pure black, smoothsteps up to
-    /// 1 at p≈0.20, smoothsteps back to 0 by p≈0.55. The anchor at p=0 is what
-    /// keeps deep blacks from greying out when +Shadows is dialed up.
-    /// </summary>
-    private static double ShadowsWeight(double p)
-    {
-        const double peak = 0.20;
-        const double hi = 0.55;
-        if (p <= 0.0 || p >= hi) return 0.0;
-        double u = p < peak ? p / peak : (hi - p) / (hi - peak);
-        return u * u * (3.0 - 2.0 * u);
-    }
-
-    /// <summary>
-    /// Bell weight for the Highlights region, mirror of <see cref="ShadowsWeight"/>:
-    /// 0 below p=0.45, 1 at p≈0.78, 0 at pure white. The anchor at p=1 preserves
-    /// spectral highlights when −Highlights is used to recover bright areas.
-    /// </summary>
-    private static double HighlightsWeight(double p)
-    {
-        const double lo = 0.45;
-        const double peak = 0.78;
-        if (p <= lo || p >= 1.0) return 0.0;
-        double u = p < peak ? (p - lo) / (peak - lo) : (1.0 - p) / (1.0 - peak);
-        return u * u * (3.0 - 2.0 * u);
     }
 
     // Sliding-window box blur, horizontal then vertical, edges clamp-extend.
