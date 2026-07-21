@@ -66,17 +66,27 @@ public class LocalHighlightsTests
         Assert.True(midDrop < brightDrop * 0.1, $"midtone barely moves, mid {midDrop:F5} vs bright {brightDrop:F4}");
     }
 
-    // ── 3. Shadows are essentially unchanged ───────────────────────────────
+    // ── 3. Deep shadows are bit-exact; the upper shadows move only gently ───
     [Fact]
-    public void Shadows_AreUnchanged()
+    public void DeepShadows_AreExact_UpperShadowsMoveOnlyGently()
     {
         const int w = 24, h = 24, n = w * h;
-        var (r, g, b) = Uniform(n, 0.03);
-        LocalHighlights.Apply(r, g, b, w, h, new LocalHighlights.Options { Highlights = -100, Radius = 4 });
 
-        // Below the knee the soft knee is exactly the identity and detailGain is
-        // exactly 1, so the log round-trip returns the input.
-        Assert.Equal(0.03, Lum(r[n / 2], g[n / 2], b[n / 2]), 6);
+        // Below BlacksGuardLoEv (~0.018 linear) the amplitude is tapered to exactly 0 and
+        // detailGain is exactly 1, so the log round-trip returns the input bit-for-bit —
+        // deep shadows and blacks are untouched and Highlights never fights Blacks.
+        var (r, g, b) = Uniform(n, 0.01);
+        LocalHighlights.Apply(r, g, b, w, h, new LocalHighlights.Options { Highlights = -100, Radius = 4 });
+        Assert.Equal(0.01, Lum(r[n / 2], g[n / 2], b[n / 2]), 6);
+
+        // Just inside the guarded band Lightroom still applies a small floor pull (this is
+        // measured, not incidental), but it must stay gentle — well under an eighth of a
+        // stop — rather than reach these tones the way the highlight band does above.
+        var (r2, g2, b2) = Uniform(n, 0.03);
+        LocalHighlights.Apply(r2, g2, b2, w, h, new LocalHighlights.Options { Highlights = -100, Radius = 4 });
+        double drop = 0.03 - Lum(r2[n / 2], g2[n / 2], b2[n / 2]);
+        Assert.True(drop > 0.0 && drop < 0.03 * 0.12,
+            $"upper-shadow floor pull should be small, drop {drop:F5}");
     }
 
     // ── 4. RGB ratios are preserved for nonzero pixels ─────────────────────
@@ -140,11 +150,12 @@ public class LocalHighlightsTests
     }
 
     // ── 7. Edge-aware: a bright/dark step keeps flat interiors clean ───────
-    // The dark side sits below the knee so its deep interior must be exact; the
-    // bright side is recovered. A Gaussian base would bleed the edge and halo —
-    // the guided filter must not.
+    // The dark side sees only the gentle floor pull; the bright side is recovered.
+    // A Gaussian base would bleed the bright edge into the dark region's base, deepen
+    // its pull and halo — the guided filter must not, so the dark interior has to match
+    // a plain dark patch rather than drift toward the bright recovery.
     [Fact]
-    public void StepImage_RecoversBright_LeavesDarkInteriorExact()
+    public void StepImage_RecoversBright_LeavesDarkInteriorClean()
     {
         const int w = 128, h = 64, n = w * h;
         var r = new float[n]; var g = new float[n]; var b = new float[n];
@@ -161,7 +172,11 @@ public class LocalHighlightsTests
         int darkInterior = (h / 2) * w + 4;     // deep in the dark half
         int brightInterior = (h / 2) * w + w - 5; // deep in the bright half
 
-        Assert.Equal(0.04, Lum(r[darkInterior], g[darkInterior], b[darkInterior]), 4);
+        // 0.04 linear sees only the ~0.14 EV floor and lands at ~0.036; a halo from the
+        // bright edge would deepen the base and drag it well below this window.
+        double dark = Lum(r[darkInterior], g[darkInterior], b[darkInterior]);
+        Assert.True(dark > 0.034 && dark < 0.039,
+            $"dark interior should see only the floor pull, not a halo, got {dark:F4}");
         Assert.True(Lum(r[brightInterior], g[brightInterior], b[brightInterior]) < 1.0,
             $"bright interior should be recovered below the clip, got {Lum(r[brightInterior], g[brightInterior], b[brightInterior]):F4}");
     }

@@ -91,29 +91,43 @@ public class ExposureAndWhitesTests
         Assert.Equal(0.8, r3, 9);
     }
 
-    // ── 10. Whites pivots: midtones and below stay exactly put ──────────────
-    [Theory]
-    [InlineData(0.02)]
-    [InlineData(0.08)]
-    [InlineData(0.15)]
-    [InlineData(0.18)]
-    public void Whites_LeavesMidtonesExact(double linear)
+    // ── 10. Whites is broad and top-weighted: deep shadows exact, midtones move ──
+    // Lightroom's Whites is NOT a narrow white point — measured on 261 exports, it moves
+    // middle grey itself by ~½…1 stop at ±100 and reaches down into the midtones, tapering
+    // to a bit-exact no-op only below the knee (~85/255). So the invariant is not "midtones
+    // exact" (it never was, in Lightroom) but "top-weighted, and exact below the knee."
+    [Fact]
+    public void Whites_IsBroadAndTopWeighted_ExactBelowTheKnee()
     {
+        // Below the knee: bit-exact no-op at any amount.
         foreach (double amount in new[] { -100.0, -50.0, 50.0, 100.0 })
+        {
+            var (r, g, b) = Grey(0.01);   // ev ≈ -4.2, well below the knee
+            BasicTone.ApplyWhites(ref r, ref g, ref b, amount);
+            Assert.Equal(0.01, r, 12);
+        }
+
+        // Above the knee it compresses (−) / expands (+); the gain is monotone in tone,
+        // so a brighter tone is moved more than a darker one — but the midtone still moves.
+        double Gain(double linear, double amount)
         {
             var (r, g, b) = Grey(linear);
             BasicTone.ApplyWhites(ref r, ref g, ref b, amount);
-            Assert.Equal(linear, r, 12);
+            return r / linear;
         }
+        Assert.True(Gain(0.5, -100) < Gain(0.18, -100),
+            "a bright tone must be compressed more than middle grey");
+        Assert.True(Gain(0.18, -100) < Gain(0.08, -100),
+            "middle grey must be compressed more than a low midtone");
+        Assert.True(Gain(0.08, -100) < 1.0, "…but the low midtone still moves — Whites is broad");
     }
 
-    // ── 11. Negative Whites pulls the top of the range down, visibly ────────
-    // Graduated: strongest at the very top, tapering to nothing by the knee. The
-    // magnitude assertion is the point — an earlier calibration put the soft
-    // knee's asymptote at ~240/255, which capped the whole slider at fifteen code
-    // values and made it feel like it did nothing.
+    // ── 11. Negative Whites compresses the bright range, top-weighted and broad ──
+    // Strongest at the top, tapering down through the midtones rather than to nothing at a
+    // high knee. The magnitude assertion is the point — the previous +0.1 EV knee left the
+    // whole midtone range untouched and was ~an order of magnitude too narrow vs Lightroom.
     [Fact]
-    public void NegativeWhites_PullsTheTopDown_TaperingToTheKnee()
+    public void NegativeWhites_CompressesTheBrightRange_TopWeighted()
     {
         double Move(double linear)
         {
@@ -122,14 +136,12 @@ public class ExposureAndWhitesTests
             return Display8(linear) - Display8(r);
         }
 
-        double atClip = Move(1.0);     // renders 255
-        double high = Move(0.5);       // renders ~245
-        double nearKnee = Move(0.20);  // renders ~198, just above the knee
+        double high = Move(0.5);   // renders ~245
+        double low  = Move(0.05);  // a low midtone
 
-        Assert.True(atClip > 25.0, $"the extreme top must move visibly, dropped only {atClip:F1}");
-        Assert.True(atClip > high, $"…more than the merely bright, {atClip:F1} vs {high:F1}");
-        Assert.True(high > nearKnee, $"…which moves more than the knee, {high:F1} vs {nearKnee:F1}");
-        Assert.True(nearKnee < 3.0, $"and it should taper out at the knee, {nearKnee:F1}");
+        Assert.True(high > 15.0, $"the bright end must move visibly, {high:F1}");
+        Assert.True(high > low, $"…more than a low midtone — Whites is top-weighted, {high:F1} vs {low:F1}");
+        Assert.True(low > 0.3, $"…but a midtone still moves at all — Whites is broad, not a white point, {low:F1}");
     }
 
     // ── 11b. Half travel gives a real fraction of the effect ────────────────

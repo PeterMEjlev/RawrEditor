@@ -249,22 +249,68 @@ public static class BasicTone
     // so the mask reflects the *region* a pixel sits in, not the pixel itself.
     // A dark pixel inside a bright region gets the highlight treatment; a bright
     // detail pixel inside a shadow region gets the shadow treatment. That's the
-    // bit that makes these sliders feel like Lightroom's: stronger gain (±3.5 EV
-    // for H/S, ±2.5 for W/B) is safe to apply because the regional mask keeps
+    // bit that makes these sliders feel like Lightroom's: a regional gain keeps
     // it from flattening the image or producing halos.
 
-    public const double ShadowsV3Stops    =  3.5;
-    public const double ShadowsV3MaskLoEv = -4.5;
-    public const double ShadowsV3MaskHiEv =  0.5;
+    /// <summary>Numerically-stable softplus, ln(1 + eˣ).</summary>
+    public static double Softplus(double x) => Math.Max(x, 0.0) + Math.Log(1.0 + Math.Exp(-Math.Abs(x)));
+
+    // ── Shadows: calibrated to Lightroom (see Compare/shadows) ─────────────
+    //
+    // ΔEV = (shadows/100) · ShadowsAmplitude(evBase), applied as a hue-preserving gain on
+    // the pixel's luminance — so, like Lightroom, a region is lifted (or deepened) by an
+    // amount set by how dark the *region* is, and detail rides through unflattened. The
+    // amplitude is the mirror image of the Highlights curve: a softplus that rises smoothly
+    // into the shadows and tapers to 0 out of the highlights.
+    //
+    // <b>Calibrated from 261 exports</b> (29 scenes × Shadows 0/±25/±50/±75/±100), by the
+    // same method as Highlights — invert the output transform to scene-linear EV, guided-
+    // filter the neutral to a regional base at the engine's radius, bin ΔEV vs base. The
+    // response is linear in the slider and near-symmetric lift/deepen. The previous flat
+    // 3.5-stop lift was ~3× too strong — worse than a no-op at +100 (RMS vs LR 51 codes) —
+    // where the calibrated curve lands at 18; over the whole set 26 → 10 code values. A
+    // detail-expansion term was measured (~0.2, weak) but not baked: it moved the match by
+    // 0.03 codes and would break the shared per-pixel-gain shape Blacks also uses.
+
+    /// <summary>Amplitude floor — the small reach Shadows keeps into the midtones (~0.15 EV
+    /// at middle grey).</summary>
+    public const double ShadowsAmpFloor   =  0.063;
+    /// <summary>Asymptotic EV-per-EV slope deep in shadow. Below 1 so a +Shadows lift never
+    /// inverts tone ordering (a darker region cannot overtake a lighter one).</summary>
+    public const double ShadowsAmpSlope   =  0.540;
+    /// <summary>Softplus knee, in stops about middle grey: where the shadow rise turns on.</summary>
+    public const double ShadowsAmpKneeEv  = -0.895;
+    /// <summary>Softplus width in EV.</summary>
+    public const double ShadowsAmpWidthEv =  0.689;
+    /// <summary>Amplitude is tapered to 0 across [<see cref="ShadowsWhitesGuardLoEv"/>,
+    /// <see cref="ShadowsWhitesGuardHiEv"/>] EV, reaching an exact no-op above it so the
+    /// highlights stay clean and Shadows never fights Whites/Highlights.</summary>
+    public const double ShadowsWhitesGuardLoEv = 0.6;
+    public const double ShadowsWhitesGuardHiEv = 1.6;
+
+    /// <summary>
+    /// Signed-magnitude EV the Shadows slider moves a region of the given regional base tone
+    /// at |slider| = 100 — a mirrored softplus, ≥ 0, tapered to 0 out of the highlights.
+    /// ~0.15 EV at middle grey, ~1 EV at 68/255, ~3 EV near black.
+    /// </summary>
+    public static double ShadowsAmplitude(double evBase)
+    {
+        double t = (ShadowsWhitesGuardHiEv - evBase) / (ShadowsWhitesGuardHiEv - ShadowsWhitesGuardLoEv);
+        if (t <= 0.0) return 0.0;
+        if (t > 1.0) t = 1.0;
+        double sp = Softplus((ShadowsAmpKneeEv - evBase) / ShadowsAmpWidthEv);
+        return (ShadowsAmpFloor + ShadowsAmpSlope * ShadowsAmpWidthEv * sp) * t;
+    }
+
     public static void ApplyShadowsV3(ref double r, ref double g, ref double b,
                                       double shadows, double evBase)
     {
         if (shadows == 0.0) return;
-        double mask = 1.0 - SmoothStep(ShadowsV3MaskLoEv, ShadowsV3MaskHiEv, evBase);
-        if (mask <= 0.0) return;
+        double amp = ShadowsAmplitude(evBase);
+        if (amp <= 0.0) return;
         double y = Luminance(r, g, b);
         if (y < LumaEps) return;
-        double gain = Math.Pow(2.0, (shadows / 100.0) * ShadowsV3Stops * mask);
+        double gain = Math.Pow(2.0, (shadows / 100.0) * amp);
         r *= gain; g *= gain; b *= gain;
     }
 
@@ -336,33 +382,41 @@ public static class BasicTone
     // stops wide; constants tuned for a conventional curve (white at linear 1.0)
     // would move the render by a couple of code values and feel inert.
 
-    // How far Whites can travel is set by the asymptote of the soft knee, which
-    // sits at knee + (1−slope)·width. Anything the slider does has to fit between
-    // that floor and where the tone started, and this output transform gives it
-    // very little to work with: it maps linear 0.20…1.00 — two and a third stops —
-    // into just 198…255. A knee at +0.5 EV with width 0.8 puts the floor at ~240,
-    // so Whites −100 could only ever move the brightest tone by fifteen code
-    // values out of 255, which reads as the slider doing nothing at all.
+    // <b>Calibrated from 261 exports</b> (29 scenes × Whites 0/±25/±50/±75/±100). Two
+    // things came out of the measurement (see Compare/whites), and one of them upends the
+    // old mental model:
     //
-    // These constants place the floor near 217/255 instead, giving the slider a
-    // ~33-value reach at the top — comparable to Highlights, which is also their
-    // relationship in Lightroom — while leaving everything below ~198/255 exactly
-    // alone. The knee cannot go much higher without the floor swallowing the
-    // slider's whole range again.
+    //  • GLOBAL is right. Binning ΔEV by the pixel's own EV explains Lightroom marginally
+    //    better than binning by a regional base — so v4's per-pixel design (no evBase) is
+    //    correct, and Whites keeps its distinct "moves an isolated specular" character.
+    //  • BUT Whites is BROAD, not a white point. Lightroom's Whites is a top-weighted tone
+    //    curve that reaches well down into the midtones: at ±100 it moves middle grey itself
+    //    by ~½…1 stop (190/255 → ~170 at −100, ~219 at +100, verified on raw pixels), tapering
+    //    to almost nothing only by ~90/255. The previous knee at +0.1 EV (≈195/255) left that
+    //    whole midtone range untouched and was ~an order of magnitude too narrow — RMS vs
+    //    Lightroom 14.0 code values, against 9.2 for the calibrated curve (−100 alone: 11.2 → 2.8).
+    //
+    // The slope is still interpolated geometrically (below), which is what reproduces the
+    // measured asymmetry: −Whites compresses sub-linearly (saturating) while +Whites expands
+    // super-linearly (accelerating into the clip). The + direction is only calibrated up to
+    // where it starts clipping to 255; past that it is extrapolated, like a boost.
 
-    /// <summary>Where Whites starts to act, in stops above middle grey. ≈195/255.</summary>
-    public const double WhitesKneeEv   = 0.1;
-    public const double WhitesWidthEv  = 0.42;
-    /// <summary>Slope at Whites −100: pulls the extreme top down toward the knee.</summary>
-    public const double WhitesMinSlope = 0.05;
-    /// <summary>Slope at Whites +100: expands the top end and drives it into the clip.</summary>
-    public const double WhitesMaxSlope = 2.2;
+    /// <summary>Where Whites tapers to a no-op, in stops about middle grey (≈85/255).
+    /// Far lower than the old +0.1 — Lightroom's Whites reaches deep into the midtones.</summary>
+    public const double WhitesKneeEv   = -2.0;
+    public const double WhitesWidthEv  = 0.20;
+    /// <summary>Slope at Whites −100: compresses the top of the range downward.</summary>
+    public const double WhitesMinSlope = 0.73;
+    /// <summary>Slope at Whites +100: expands it and drives the top into the clip. Set from
+    /// the reliable midtone part of the + response; above ~225/255 it is extrapolated (the
+    /// exports clip there), so this is deliberately a touch gentler than a raw fit wanted.</summary>
+    public const double WhitesMaxSlope = 1.45;
 
     /// <summary>
-    /// Whites as a white-point control: a slope change on the top end, pivoting at
-    /// <see cref="WhitesKneeEv"/> so midtones stay exactly put. Negative pulls the
-    /// brightest tones back down the output range (≈255→222, tapering to nothing by
-    /// ≈198); positive expands them and drives them into the clip.
+    /// Whites as Lightroom's broad top-weighted tone control: a slope change pivoting at
+    /// <see cref="WhitesKneeEv"/>, strongest at the very top and tapering smoothly down into
+    /// the midtones (it is <i>not</i> a narrow white point — see the calibration note above).
+    /// Negative compresses the bright range downward, positive expands it into the clip.
     ///
     /// <para>Comparable in strength to Highlights but different in character, which
     /// is what keeps the two sliders worth having separately: Whites is global and
