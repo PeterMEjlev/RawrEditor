@@ -92,4 +92,40 @@ public sealed class LinearRawImage
 
         return new LinearRawImage(newW, newH, dst);
     }
+
+    /// <summary>
+    /// Copy out an axis-aligned sub-rectangle, clamped to the image bounds.
+    /// Returns null when the requested rectangle misses the image entirely.
+    ///
+    /// <para>This exists so a local adjustment can re-run the develop pipeline
+    /// over the region a mask actually covers rather than over the whole frame.
+    /// The caller is responsible for padding the rectangle out far enough that
+    /// the pipeline's spatial filters — which clamp-extend at the buffer edge
+    /// and would otherwise fabricate a false boundary in the middle of the
+    /// photo — have real neighbouring pixels to read.</para>
+    /// </summary>
+    public LinearRawImage? Crop(int x, int y, int width, int height)
+    {
+        int x0 = Math.Max(0, x);
+        int y0 = Math.Max(0, y);
+        int x1 = Math.Min(Width, x + width);
+        int y1 = Math.Min(Height, y + height);
+        if (x1 <= x0 || y1 <= y0) return null;
+
+        int cropW = x1 - x0;
+        int cropH = y1 - y0;
+        var dst = new ushort[cropW * cropH * 3];
+        int srcStride = Width * 3;
+        int dstStride = cropW * 3;
+        var src = Pixels;
+
+        Parallel.For(0, cropH, row =>
+        {
+            int srcOffset = (y0 + row) * srcStride + x0 * 3;
+            int dstOffset = row * dstStride;
+            Array.Copy(src, srcOffset, dst, dstOffset, dstStride);
+        });
+
+        return new LinearRawImage(cropW, cropH, dst);
+    }
 }

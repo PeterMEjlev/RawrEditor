@@ -159,6 +159,68 @@
         </Setter>
     </Style>
 
+    <!-- Right-panel tab strip (Edit / Masks).
+         Two full-width tabs marked by an accent underline rather than the
+         raised folder tabs WPF ships: at this size a underline reads as
+         "which section am I in" without spending a border and a fill on
+         something that is only ever a two-way switch. -->
+    <Style x:Key="PanelTabControl" TargetType="{x:Type TabControl}">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type TabControl}">
+                    <DockPanel>
+                        <Border DockPanel.Dock="Top"
+                                Background="{StaticResource BgToolbarBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="0,0,0,1">
+                            <!-- UniformGrid so the two headers split the panel
+                                 width evenly and the strip reads as a segmented
+                                 control rather than two left-packed labels. -->
+                            <UniformGrid Rows="1" IsItemsHost="True" />
+                        </Border>
+                        <ContentPresenter ContentSource="SelectedContent" />
+                    </DockPanel>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="PanelTabItem" TargetType="{x:Type TabItem}">
+        <Setter Property="Foreground" Value="{StaticResource TextDimBrush}" />
+        <Setter Property="FontSize" Value="11" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type TabItem}">
+                    <Border x:Name="Bd"
+                            Background="Transparent"
+                            BorderBrush="Transparent"
+                            BorderThickness="0,0,0,2"
+                            Padding="0,9">
+                        <ContentPresenter ContentSource="Header"
+                                          HorizontalAlignment="Center"
+                                          VerticalAlignment="Center" />
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background" Value="{StaticResource BgControlHoverBrush}" />
+                            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <!-- ScrollBar (slim, dark) -->
     <Style TargetType="{x:Type Thumb}" x:Key="ScrollThumbStyle">
         <Setter Property="Template">
@@ -213,10 +275,16 @@
          fill (PART_SelectionRange) so a value of 0 reads as "neutral" and the
          fill grows left/right as you push the slider. Lifted from RAWR's
          ExposureSliderStyle. -->
+    <!-- Background is the track; Foreground is the accent fill that grows from the
+         neutral origin. Both are template-bound so a row can hand the slider a
+         gradient track (Temp, Tint, Vibrance, Saturation) and suppress the accent
+         fill, which would otherwise paint over the gradient it sits on. -->
     <Style x:Key="AdjustmentSlider" TargetType="{x:Type Slider}">
         <Setter Property="FocusVisualStyle" Value="{x:Null}" />
         <Setter Property="IsSelectionRangeEnabled" Value="True" />
         <Setter Property="Height" Value="18" />
+        <Setter Property="Background" Value="{StaticResource BgControlBrush}" />
+        <Setter Property="Foreground" Value="{StaticResource AccentBrush}" />
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="{x:Type Slider}">
@@ -229,9 +297,20 @@
                         <Border Grid.Row="1"
                                 Height="4"
                                 VerticalAlignment="Center"
-                                Background="{StaticResource BgControlBrush}"
+                                Background="{TemplateBinding Background}"
                                 CornerRadius="2"
                                 IsHitTestVisible="False" />
+                        <!-- The selection fill is declared before the Track so it
+                             paints *under* the thumb. Declared after, it drew its
+                             4px accent bar straight across the thumb's face — most
+                             visible on a slider parked near its origin, where the
+                             bar is short and lands right on top. -->
+                        <Canvas Grid.Row="1" Height="4" VerticalAlignment="Center" IsHitTestVisible="False">
+                            <Border x:Name="PART_SelectionRange"
+                                    Height="4"
+                                    Background="{TemplateBinding Foreground}"
+                                    Visibility="Hidden" />
+                        </Canvas>
                         <Track x:Name="PART_Track" Grid.Row="1">
                             <Track.DecreaseRepeatButton>
                                 <RepeatButton Command="Slider.DecreaseLarge" Focusable="False">
@@ -264,18 +343,71 @@
                                 </Thumb>
                             </Track.Thumb>
                         </Track>
-                        <Canvas Grid.Row="1" Height="4" VerticalAlignment="Center" IsHitTestVisible="False">
-                            <Border x:Name="PART_SelectionRange"
-                                    Height="4"
-                                    Background="{StaticResource AccentBrush}"
-                                    Visibility="Hidden" />
-                        </Canvas>
                     </Grid>
                     <ControlTemplate.Triggers>
                         <Trigger Property="IsSelectionRangeEnabled" Value="True">
                             <Setter TargetName="PART_SelectionRange" Property="Visibility" Value="Visible" />
                         </Trigger>
                     </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Colour Mixer band swatches. A ListBox rather than eight ToggleButtons so
+         the single-selection invariant and arrow-key navigation come for free.
+         Unselected bands are rings and the selected one fills in — the same way
+         Lightroom marks the active band, and it survives being read at a glance
+         in a row of eight similar hues. -->
+    <Style x:Key="ColorBandSwatch" TargetType="{x:Type ListBoxItem}">
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+        <Setter Property="ToolTip" Value="{Binding Name}" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type ListBoxItem}">
+                    <!-- Transparent backdrop so the whole cell is clickable, not
+                         just the 22 px ring inside it. -->
+                    <Grid Background="Transparent" Margin="0,2,7,2">
+                        <Ellipse x:Name="Ring"
+                                 Width="22" Height="22"
+                                 Stroke="{Binding Swatch}"
+                                 StrokeThickness="2.5"
+                                 Fill="Transparent" />
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Ring" Property="Opacity" Value="0.75" />
+                        </Trigger>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="Ring" Property="Fill" Value="{Binding Swatch}" />
+                            <Setter TargetName="Ring" Property="Opacity" Value="1" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="ColorBandSelector" TargetType="{x:Type ListBox}">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+        <Setter Property="ItemContainerStyle" Value="{StaticResource ColorBandSwatch}" />
+        <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled" />
+        <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Disabled" />
+        <Setter Property="ItemsPanel">
+            <Setter.Value>
+                <ItemsPanelTemplate>
+                    <StackPanel Orientation="Horizontal" />
+                </ItemsPanelTemplate>
+            </Setter.Value>
+        </Setter>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type ListBox}">
+                    <ItemsPresenter />
                 </ControlTemplate>
             </Setter.Value>
         </Setter>

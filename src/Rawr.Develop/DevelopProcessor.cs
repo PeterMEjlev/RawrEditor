@@ -13,8 +13,9 @@ namespace Rawr.Develop;
 /// <see cref="BasicTone"/>:
 ///
 ///   1. White balance + Exposure are per-channel <i>linear</i> gains applied
-///      to the sensor value (Exposure = 2^EV). Values are kept unclamped from
-///      here on so highlight detail above the old 65535 ceiling survives.
+///      to the sensor value (Exposure = 2^EV, white balance from
+///      <see cref="WhiteBalance"/>'s illuminant model). Values are kept unclamped
+///      from here on so highlight detail above the old 65535 ceiling survives.
 ///   2. Highlights / Shadows / Contrast run in scene-linear log-EV space as a
 ///      single hue-preserving luminance ratio; Whites / Blacks then remap the
 ///      linear endpoints. All five are no-ops at neutral.
@@ -24,9 +25,12 @@ namespace Rawr.Develop;
 ///      lookups per pixel). At neutral the whole pipeline reduces to exactly
 ///      this composed LUT, so the baseline render matches Lightroom.
 ///   4. Colour (Vibrance/Saturation) needs cross-channel work, so pixels are
-///      decomposed into luma + Rec.709 chroma. The chroma planes get the same
-///      small box blur RAWR uses to kill high-ISO colour speckle, then the
-///      saturation/vibrance scale, then recompose.
+///      decomposed into luma + Rec.709 chroma, then the saturation/vibrance
+///      scale, then recompose.
+///   4a. Detail — colour + luminance noise reduction and capture sharpening —
+///      runs on those planes at the end of the decompose. See <see cref="Detail"/>.
+///   4b. The Color Mixer (per-hue-band H/S/L) runs on the recomposed RGB, in
+///      HSL — see <see cref="ColorMixer"/> for why it is not on the chroma pair.
 ///   5. TPDF dither before the 8-bit round so the sRGB curve's compression of
 ///      the bright end doesn't band in skies and skin.
 ///
@@ -52,15 +56,9 @@ public static class DevelopProcessor
     public static BitmapSource Render(LinearRawImage raw, DevelopSettings s, CancellationToken ct = default)
     {
         var po = new ParallelOptions { CancellationToken = ct };
-        var (w, h, luma, cb, cr) = DecomposeToPlanes(raw, s, po, ct);
+        var (w, h, r, g, b) = BuildRgbPlanes(raw, s, po, ct);
         int stride = w * 3;
         byte[] bgr = new byte[h * stride];
-
-        // ── Colour scale: baseline pop + Saturation + chroma-aware Vibrance ──
-        // 1.12 baseline keeps the neutral render's gentle camera-like saturation.
-        float satMul = 1.12f * (1f + (float)(s.Saturation / 100.0));
-        if (satMul < 0f) satMul = 0f;
-        float vib = (float)(s.Vibrance / 100.0);
 
         Parallel.For(0, h, po, yy =>
         {
@@ -74,28 +72,9 @@ public static class DevelopProcessor
             for (int x = 0; x < w; x++)
             {
                 int i = rowI + x;
-                float y = luma[i];
-                float cbv = cb[i];
-                float crv = cr[i];
-
-                // Vibrance: boost weak colours more than already-saturated ones.
-                // Chroma magnitude is in 0..~180 (8-bit-ish luma units); the
-                // 0.012 scale puts the rolloff knee around mid-saturation.
-                if (vib != 0f)
-                {
-                    float mag = MathF.Sqrt(cbv * cbv + crv * crv);
-                    float weak = 1f / (1f + 0.012f * mag);   // 1 → 0 as colour strengthens
-                    float vibMul = 1f + vib * weak;
-                    if (vibMul < 0f) vibMul = 0f;
-                    cbv *= vibMul;
-                    crv *= vibMul;
-                }
-                cbv *= satMul;
-                crv *= satMul;
-
-                float lr = y + crv;
-                float lb = y + cbv;
-                float lg = (y - 0.2126f * lr - 0.0722f * lb) * (1f / 0.7152f);
+                float lr = r[i];
+                float lg = g[i];
+                float lb = b[i];
 
                 // TPDF dither (sum of two uniforms) per channel, neutral-coloured.
                 rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
@@ -132,6 +111,60 @@ public static class DevelopProcessor
     }
 
     /// <summary>
+    /// Render the sharpening mask as a black-and-white image: white is sharpened,
+    /// black is masked out. This is Lightroom's Alt-drag visualisation, and its
+    /// only job is to show where Masking is taking effect.
+    ///
+    /// <para>Sharpening is suppressed for this pass — not as an optimisation, but
+    /// because the mask is defined on the luma <see cref="Detail.Sharpen"/> would
+    /// be handed: after noise reduction, before any sharpening. Running it over an
+    /// already-sharpened plane would show the mask of a different image.</para>
+    ///
+    /// <para>No dither. Every other output here is a photograph, where dither buys
+    /// gradients; this is a diagnostic, and noise in it would read as mask
+    /// structure that isn't there.</para>
+    /// </summary>
+    public static BitmapSource RenderSharpenMask(LinearRawImage raw, DevelopSettings s,
+                                                 CancellationToken ct = default)
+    {
+        var po = new ParallelOptions { CancellationToken = ct };
+
+        // Same crop the photo is rendered under — the mask has to line up with
+        // what the viewer is showing, not with the uncropped sensor frame.
+        raw = Geometry.Apply(raw, s.Geometry);
+
+        var unsharpened = s.Clone();
+        unsharpened.Sharpening = 0;
+        Effects.Airlight? airlight = null;
+        var (w, h, luma, _, _) = DecomposeToPlanes(raw, unsharpened, po, ct,
+                                                   raw.Width, raw.Height, ref airlight);
+
+        var sharpen = Detail.BuildSharpen(s.Sharpening, s.SharpenRadius, s.SharpenDetail, s.SharpenMasking);
+        float[] mask = Detail.RenderMask(luma, w, h, sharpen, po);
+
+        int stride = w * 3;
+        byte[] bgr = new byte[h * stride];
+        Parallel.For(0, h, po, yy =>
+        {
+            int row = yy * stride;
+            int rowI = yy * w;
+            for (int x = 0; x < w; x++)
+            {
+                float m = mask[rowI + x];
+                int v = (int)(m * 255f + 0.5f);
+                if (v < 0) v = 0; else if (v > 255) v = 255;
+                int o = row + x * 3;
+                bgr[o] = bgr[o + 1] = bgr[o + 2] = (byte)v;
+            }
+        });
+
+        ct.ThrowIfCancellationRequested();
+        var result = BitmapSource.Create(w, h, 96, 96, PixelFormats.Bgr24, null, bgr, stride);
+        result.Freeze();
+        return result;
+    }
+
+    /// <summary>
     /// Full-quality export render. Runs the identical tone pipeline as the
     /// preview (<see cref="DecomposeToPlanes"/>) but quantises to 8- or 16-bit
     /// and, for <see cref="ExportColorSpace.AdobeRgb"/>, re-encodes each pixel
@@ -144,11 +177,7 @@ public static class DevelopProcessor
                                             CancellationToken ct = default)
     {
         var po = new ParallelOptions { CancellationToken = ct };
-        var (w, h, luma, cb, cr) = DecomposeToPlanes(raw, s, po, ct);
-
-        float satMul = 1.12f * (1f + (float)(s.Saturation / 100.0));
-        if (satMul < 0f) satMul = 0f;
-        float vib = (float)(s.Vibrance / 100.0);
+        var (w, h, rPlane, gPlane, bPlane) = BuildRgbPlanes(raw, s, po, ct);
 
         bool adobe = colorSpace == ExportColorSpace.AdobeRgb;
         float max = sixteenBit ? 65535f : 255f;
@@ -170,25 +199,9 @@ public static class DevelopProcessor
             for (int x = 0; x < w; x++)
             {
                 int i = rowI + x;
-                float y = luma[i];
-                float cbv = cb[i];
-                float crv = cr[i];
-
-                if (vib != 0f)
-                {
-                    float mag = MathF.Sqrt(cbv * cbv + crv * crv);
-                    float weak = 1f / (1f + 0.012f * mag);
-                    float vibMul = 1f + vib * weak;
-                    if (vibMul < 0f) vibMul = 0f;
-                    cbv *= vibMul;
-                    crv *= vibMul;
-                }
-                cbv *= satMul;
-                crv *= satMul;
-
-                float lr = y + crv;
-                float lb = y + cbv;
-                float lg = (y - 0.2126f * lr - 0.0722f * lb) * (1f / 0.7152f);
+                float lr = rPlane[i];
+                float lg = gPlane[i];
+                float lb = bPlane[i];
 
                 // sRGB display value in 0..1 (the pipeline encodes to sRGB).
                 float fr = lr * (1f / 255f); if (fr < 0f) fr = 0f; else if (fr > 1f) fr = 1f;
@@ -283,6 +296,253 @@ public static class DevelopProcessor
         => c <= 0.04045 ? c / 12.92 : Math.Pow((c + 0.055) / 1.055, 2.4);
 
     /// <summary>
+    /// The full render up to (but not including) dither and quantisation: the
+    /// global pipeline, then every active mask composited over it. Returns
+    /// fractional 8-bit sRGB planes in 0…255. Both <see cref="Render"/> and
+    /// <see cref="RenderExport"/> start here, so preview and export cannot drift.
+    /// </summary>
+    private static (int w, int h, float[] r, float[] g, float[] b)
+        BuildRgbPlanes(LinearRawImage raw, DevelopSettings s, ParallelOptions po, CancellationToken ct)
+    {
+        // Crop, straighten and orientation resolve into the buffer before any
+        // tone work, and every stage below then reads "the photograph" — which
+        // after a crop is the cropped frame, not the sensor. That is not a
+        // convenience: the regional filters size their radius from the frame,
+        // Dehaze estimates one airlight for it, and the mask rectangles are
+        // normalised to it. Cropping afterwards would leave all three describing
+        // a picture nobody is going to see. Neutral geometry hands the buffer
+        // straight back, so the baseline render is untouched.
+        raw = Geometry.Apply(raw, s.Geometry);
+
+        // Estimated on the full frame by the pass below, then handed to every
+        // mask crop so they dehaze against the same haze colour — see
+        // Effects.EstimateAirlight for why a crop must not estimate its own.
+        Effects.Airlight? airlight = null;
+
+        var planes = RenderRgbPlanes(raw, s, po, ct, raw.Width, raw.Height, ref airlight);
+        ComposeMasks(raw, s, planes.r, planes.g, planes.b, po, ct, airlight);
+
+        // Grain goes on last, after the masks. It is a property of the print
+        // rather than of any region, and running it inside each mask's crop
+        // would tile the noise field — the pattern is a function of position,
+        // so a crop would generate a different one and the mask's outline would
+        // appear as a seam in the grain.
+        var grain = Effects.BuildGrain(s.GrainAmount, s.GrainSize, s.GrainRoughness,
+                                       raw.Width, raw.Height);
+        Effects.ApplyGrain(planes.r, planes.g, planes.b, planes.w, planes.h, grain, po);
+
+        return planes;
+    }
+
+    /// <summary>
+    /// <see cref="DecomposeToPlanes"/> followed by the per-pixel colour stage —
+    /// Vibrance/Saturation on the chroma pair, recompose to RGB, then the Colour
+    /// Mixer — leaving fractional 8-bit sRGB in three planes.
+    ///
+    /// <para>The luma/chroma buffers are <i>reused</i> as the RGB output rather
+    /// than a second trio being allocated: at full export resolution three more
+    /// float planes is another half-gigabyte on a 45 MP file. Every read for a
+    /// pixel happens before any write to it, so the aliasing is safe.</para>
+    ///
+    /// <para><paramref name="contextW"/>/<paramref name="contextH"/> are the
+    /// dimensions of the image this buffer is <i>part of</i>, which differ from
+    /// the buffer's own only when rendering a mask's crop. The regional filters
+    /// size their radius from them so a crop measures "region" over the same
+    /// neighbourhood the full frame does — see <see cref="EdgeAwareLuma.RegionRadius"/>.</para>
+    /// </summary>
+    private static (int w, int h, float[] r, float[] g, float[] b)
+        RenderRgbPlanes(LinearRawImage raw, DevelopSettings s, ParallelOptions po,
+                        CancellationToken ct, int contextW, int contextH,
+                        ref Effects.Airlight? airlight)
+    {
+        var (w, h, luma, cb, cr) = DecomposeToPlanes(raw, s, po, ct, contextW, contextH, ref airlight);
+
+        // ── Colour scale: baseline pop + Saturation + chroma-aware Vibrance ──
+        var presence = Presence.Build(s.Vibrance, s.Saturation);
+        // The Color Mixer works in HSL on recomposed RGB, so it runs after the
+        // recompose below rather than on the chroma pair. Inactive at neutral,
+        // where Apply returns before touching the pixel.
+        var mixer = ColorMixer.Build(s.ColorMixer);
+
+        Parallel.For(0, h, po, yy =>
+        {
+            int rowI = yy * w;
+            for (int x = 0; x < w; x++)
+            {
+                int i = rowI + x;
+                float y = luma[i];
+                float cbv = cb[i];
+                float crv = cr[i];
+
+                Presence.Apply(presence, ref cbv, ref crv);
+
+                float lr = y + crv;
+                float lb = y + cbv;
+                float lg = (y - 0.2126f * lr - 0.0722f * lb) * (1f / 0.7152f);
+
+                ColorMixer.Apply(mixer, ref lr, ref lg, ref lb);
+
+                // Aliased writes — cr becomes R, luma becomes G, cb becomes B.
+                cr[i] = lr;
+                luma[i] = lg;
+                cb[i] = lb;
+            }
+        });
+
+        ct.ThrowIfCancellationRequested();
+        return (w, h, cr, luma, cb);
+    }
+
+    /// <summary>
+    /// Composite each active mask onto the already-rendered global planes.
+    ///
+    /// <para><b>The model is re-render and crossfade.</b> For each mask the whole
+    /// pipeline runs a second time with the mask's offsets folded into the global
+    /// settings, and the two results are mixed per pixel by the mask's weight.
+    /// That is more expensive than modulating slider strengths inside the tone
+    /// loop, and it is the right trade here: a masked Exposure is then <i>exactly</i>
+    /// the same operator as the global one, including the spatial stages
+    /// (Highlights' local tone mapping, the v3 regional masks) that a per-pixel
+    /// strength scale cannot express at all. Masks that disagree with the global
+    /// render only where they are actually applied is a property worth paying for.</para>
+    ///
+    /// <para><b>Cost is bounded by the mask, not the frame.</b> A radial covering
+    /// a tenth of the picture re-renders a tenth of the pixels, because the second
+    /// pass runs over the mask's bounding rectangle. The rectangle is padded first:
+    /// the pipeline's spatial filters clamp-extend at the buffer edge, so an
+    /// unpadded crop would invent a hard boundary in the middle of the photo and
+    /// leave a bright rim inside the mask. Padding by twice the regional radius
+    /// covers the guided filter's two chained box blurs, which is the widest reach
+    /// anything in the pipeline has.</para>
+    ///
+    /// <para><b>Masks accumulate.</b> Each contributes the difference between its
+    /// own render and the global one, scaled by its weight, and those differences
+    /// <i>add</i> — two overlapping masks that each brighten a region both
+    /// brighten it, rather than the later one replacing the earlier. The
+    /// alternative (crossfading each mask onto the running composite) makes the
+    /// last mask in the list win outright wherever it sits at full weight, which
+    /// means a mask can silently undo the one beneath it.</para>
+    ///
+    /// <para>Two consequences worth knowing. Masks are <b>order-independent</b>:
+    /// addition commutes, so re-ordering the list cannot change the render. And
+    /// the sum is taken in display space, so overlapping adjustments add their
+    /// visible <i>effect</i> rather than their slider values — two +1 EV masks
+    /// land somewhat brighter than a single +2 EV one would, because the output
+    /// curve compresses the second stop and this addition happens after it.</para>
+    /// </summary>
+    private static void ComposeMasks(LinearRawImage raw, DevelopSettings s,
+                                     float[] r, float[] g, float[] b,
+                                     ParallelOptions po, CancellationToken ct,
+                                     Effects.Airlight? airlight)
+    {
+        int w = raw.Width;
+        int h = raw.Height;
+
+        // Widest neighbourhood any stage reads, doubled for the guided filter's
+        // blur-of-a-blur, plus a margin for Detail's small kernels (chroma NR
+        // reaches 9 px at Colour 100; the sharpening Gaussian about the same).
+        int regional = Math.Max(EdgeAwareLuma.RegionRadius(w, h),
+                       Math.Max(LocalHighlights.RegionRadius(w, h), Effects.MaxRegionRadius(w, h)));
+        int pad = 2 * regional + 16;
+
+        // Every mask measures its delta against the *global* render, so that has
+        // to survive the compositing — the planes themselves are being written
+        // as we go. Snapshotting only the union of the mask areas rather than
+        // the whole frame keeps the cost proportional to what the masks actually
+        // cover, which at export resolution is the difference between a few MB
+        // and a few hundred.
+        var jobs = new List<(MaskSettings mask, PixelRect area)>();
+        foreach (var mask in s.ActiveMasks)
+        {
+            var bounds = mask.Bounds(w, h);
+            if (!bounds.IsEmpty) jobs.Add((mask, bounds));
+        }
+        if (jobs.Count == 0) return;
+
+        int ux0 = w, uy0 = h, ux1 = 0, uy1 = 0;
+        foreach (var (_, area) in jobs)
+        {
+            ux0 = Math.Min(ux0, area.X);
+            uy0 = Math.Min(uy0, area.Y);
+            ux1 = Math.Max(ux1, area.Right);
+            uy1 = Math.Max(uy1, area.Bottom);
+        }
+        int uw = ux1 - ux0, uh = uy1 - uy0;
+        if (uw <= 0 || uh <= 0) return;
+
+        var baseR = new float[uw * uh];
+        var baseG = new float[uw * uh];
+        var baseB = new float[uw * uh];
+        Parallel.For(0, uh, po, row =>
+        {
+            int src = (uy0 + row) * w + ux0;
+            int dst = row * uw;
+            Array.Copy(r, src, baseR, dst, uw);
+            Array.Copy(g, src, baseG, dst, uw);
+            Array.Copy(b, src, baseB, dst, uw);
+        });
+
+        foreach (var (mask, area) in jobs)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // The region actually rendered: the mask's area plus enough context
+            // for the spatial filters, clipped to the image.
+            int px0 = Math.Max(0, area.X - pad);
+            int py0 = Math.Max(0, area.Y - pad);
+            int px1 = Math.Min(w, area.Right + pad);
+            int py1 = Math.Min(h, area.Bottom + pad);
+            int padW = px1 - px0;
+            int padH = py1 - py0;
+            if (padW <= 0 || padH <= 0) continue;
+
+            // Once the padding has swallowed the whole frame — a large or
+            // inverted mask — cropping is pure copying, so render in place.
+            bool wholeFrame = px0 == 0 && py0 == 0 && padW == w && padH == h;
+            var region = wholeFrame ? raw : raw.Crop(px0, py0, padW, padH);
+            if (region is null) continue;
+
+            var masked = mask.Adjustments.ApplyTo(s);
+            // The crop carries no masks of its own: they are composited here, in
+            // image space, and recursing would apply every mask inside every
+            // other mask's region. Geometry goes the same way — it was already
+            // resolved into the buffer this region was cut from, and re-applying
+            // it would crop the crop.
+            masked.Masks = new List<MaskSettings>();
+            masked.Geometry = new GeometrySettings();
+
+            var regionAirlight = airlight;
+            var (_, _, mr, mg, mb) = RenderRgbPlanes(region, masked, po, ct, w, h, ref regionAirlight);
+            var weights = mask.Weights(w, h, area);
+
+            Parallel.For(0, area.Height, po, row =>
+            {
+                int imageRow = (area.Y + row) * w;
+                int regionRow = (area.Y + row - py0) * padW;
+                int baseRow = (area.Y + row - uy0) * uw;
+                int weightRow = row * area.Width;
+                for (int col = 0; col < area.Width; col++)
+                {
+                    float t = weights[weightRow + col];
+                    if (t <= 0f) continue;
+
+                    int i = imageRow + area.X + col;
+                    int j = regionRow + area.X + col - px0;
+                    int k = baseRow + area.X + col - ux0;
+
+                    // Add this mask's departure from the global render. Against
+                    // the snapshot, not against r[i] — reading the running
+                    // composite here is exactly what would make a later mask
+                    // overwrite an earlier one instead of adding to it.
+                    r[i] += (mr[j] - baseR[k]) * t;
+                    g[i] += (mg[j] - baseG[k]) * t;
+                    b[i] += (mb[j] - baseB[k]) * t;
+                }
+            });
+        }
+    }
+
+    /// <summary>
     /// The shared tone pipeline: per-channel gain → EV-space H/S/C → endpoint
     /// remap → display LUT → luma/chroma decompose → chroma denoise. Returns
     /// the post-blur planes in 0..255 perceptual units (luma) and Rec.709
@@ -291,22 +551,32 @@ public static class DevelopProcessor
     /// identical maths and differ only in the final colour-scale/quantise.
     /// </summary>
     private static (int w, int h, float[] luma, float[] cb, float[] cr)
-        DecomposeToPlanes(LinearRawImage raw, DevelopSettings s, ParallelOptions po, CancellationToken ct)
+        DecomposeToPlanes(LinearRawImage raw, DevelopSettings s, ParallelOptions po,
+                          CancellationToken ct, int contextW, int contextH,
+                          ref Effects.Airlight? airlight)
     {
         int w = raw.Width;
         int h = raw.Height;
         int n = w * h;
         ushort[] src = raw.Pixels;
 
+        // Regional filters size themselves from the image this buffer belongs to,
+        // which is the buffer itself except when rendering a mask's crop.
+        if (contextW <= 0) contextW = w;
+        if (contextH <= 0) contextH = h;
+
         // ── Per-channel linear gain: exposure × white balance ──
+        // White balance comes from real illuminant chromaticities (see
+        // WhiteBalance): Temperature names a Kelvin on the blackbody/daylight
+        // locus, Tint displaces it along Duv, and the pair becomes von Kries
+        // gains that preserve luma. Staying diagonal is a requirement, not a
+        // simplification — HighlightReconstruction below is handed these same
+        // three numbers as each channel's clipping point.
         double expGain = BasicTone.ExposureGain(s.Exposure);
-        double t = Math.Clamp(s.Temperature / 100.0, -1.0, 1.0);
-        double ti = Math.Clamp(s.Tint / 100.0, -1.0, 1.0);
-        // Warm (+T) lifts red, drops blue. Tint +/- trades green against magenta.
-        // Factors stay well inside (0, 2) for the full slider travel.
-        double gainR = expGain * (1.0 + 0.45 * t);
-        double gainB = expGain * (1.0 - 0.45 * t);
-        double gainG = expGain * (1.0 - 0.30 * ti);
+        var (wbR, wbG, wbB) = WhiteBalance.Gains(s.EffectiveKelvin, s.Tint);
+        double gainR = expGain * wbR;
+        double gainG = expGain * wbG;
+        double gainB = expGain * wbB;
 
         // ── Highlights/Shadows/Contrast/Whites/Blacks: EV-space, linear ──
         // These five run in scene-linear space *before* the display curve,
@@ -329,30 +599,37 @@ public static class DevelopProcessor
         double co = s.Contrast;
         double wh = s.Whites;
         double bk = s.Blacks;
-        int contrastV    = s.ContrastVersion;
-        int highlightsV  = s.HighlightsVersion;
-        int shadowsV     = s.ShadowsVersion;
-        int whitesV      = s.WhitesVersion;
-        int blacksV      = s.BlacksVersion;
         double contrastSlope = BasicTone.ContrastSlope(co);
-        double whiteLin = BasicTone.WhiteLin(wh);
-        double blackLin = BasicTone.BlackLin(bk);
-        double invSpan = 1.0 / (whiteLin - blackLin);
-        // Fast paths only fire when *every* slider in the block is v1 (the
-        // original combined formula). As soon as one slider is on v2/v3 we
-        // fall through to per-slider passes.
-        bool combinedHsl  = highlightsV == 1 && shadowsV == 1 && contrastV == 1;
-        bool combinedEnds = whitesV == 1 && blacksV == 1;
-        bool doEv = hl != 0.0 || sh != 0.0 || co != 0.0;
+        double ex = s.Exposure;
+        // Highlights is now a SPATIAL operator (edge-aware base/detail local tone
+        // mapping — see LocalHighlights), so it can't ride the per-pixel EV pass.
+        // When it's engaged we materialise gained linear RGB planes, run it once
+        // over the whole image, then feed those planes into Pass 1.
+        bool doLocalHighlights = hl != 0.0;
+        bool doEv = sh != 0.0 || co != 0.0;
         bool doEnds = wh != 0.0 || bk != 0.0;
-        // Edge-aware/context path: only build the regional luminance plane when
-        // a nonzero slider version will actually read it. This keeps neutral
-        // renders cheap even though Highlights defaults to the calibrated v4.
-        bool needsEvBase =
-            (hl != 0.0 && (highlightsV == 3 || highlightsV == 4)) ||
-            (sh != 0.0 && shadowsV == 3) ||
-            (wh != 0.0 && whitesV == 3) ||
-            (bk != 0.0 && blacksV == 3);
+        // Build the regional luminance plane whenever Shadows/Blacks are active;
+        // those v3 sliders consult evBase. Highlights no longer does, and neither
+        // does Whites since v4 made it global.
+        bool needsEvBase = sh != 0.0 || bk != 0.0;
+
+        // Rebuilding clipped channels only changes the render when something
+        // downstream pulls highlights back below white — otherwise the recovered
+        // headroom clips to white exactly as the unreconstructed value did, and we
+        // would pay for it to be invisible. So gate on the sliders that pull down.
+        // Negative Exposure is on this list because that is precisely how Lightroom
+        // recovers a blown sky when you pull the exposure back.
+        bool doReconstruct = hl < 0.0 || ex < 0.0 || wh < 0.0 || co < 0.0;
+
+        // Dehaze is a scene-referred correction — the haze model it inverts is
+        // only valid on linear light — so it also needs the planes, and it runs
+        // before every slider that reads them.
+        bool doDehaze = s.Dehaze != 0.0;
+
+        // Any of these stages needs the gained planes materialised. At neutral
+        // all are false, so the cheap inline-gain path survives and the baseline
+        // render stays byte-identical.
+        bool needPlanes = doLocalHighlights || doReconstruct || doDehaze;
         const double inv65535 = 1.0 / 65535.0;
 
         // ── Display LUT: normalised linear → fractional 8-bit perceptual ──
@@ -360,14 +637,74 @@ public static class DevelopProcessor
         // S). No slider terms — those are the EV-space block above.
         float[] lut = BuildDisplayLut();
 
+        // ── Pass H (conditional): the stages that need whole planes ──
+        // Materialise the gained scene-linear RGB planes, rebuild whatever the
+        // sensor clipped, then run the edge-aware local-tone Highlights. Pass 1
+        // reads these planes instead of re-gaining from src.
+        //
+        // The order is the pipeline's tone order and it matters: reconstruction has
+        // to see the raw gained values so the clip sits exactly at each channel's
+        // own gain, and it is conceptually part of the decode, so it precedes every
+        // slider that reads those planes.
+        float[]? rLin = null, gLin = null, bLin = null;
+        if (needPlanes)
+        {
+            rLin = new float[n]; gLin = new float[n]; bLin = new float[n];
+            Parallel.For(0, h, po, yy =>
+            {
+                int rowI = yy * w;
+                int srcIdx = rowI * 3;
+                for (int x = 0; x < w; x++)
+                {
+                    int i = rowI + x;
+                    rLin[i] = (float)(src[srcIdx]     * gainR * inv65535);
+                    gLin[i] = (float)(src[srcIdx + 1] * gainG * inv65535);
+                    bLin[i] = (float)(src[srcIdx + 2] * gainB * inv65535);
+                    srcIdx += 3;
+                }
+            });
+
+            // Recover the channels LibRaw clipped at the sensor white level, so the
+            // sliders below have real above-white detail to bring down rather than a
+            // flat plateau. The clip lands at each channel's own gain, not at 1.0,
+            // because white balance and exposure are already folded into the planes.
+            if (doReconstruct)
+                HighlightReconstruction.Apply(rLin, gLin, bLin, w, h,
+                                              gainR, gainG, gainB, null, po);
+
+            // Dehaze before the tone sliders: haze is part of what the camera
+            // recorded, so removing it belongs with the decode, and Highlights
+            // or Contrast applied to a still-hazy image would be spending their
+            // travel on the haze rather than on the scene.
+            if (doDehaze)
+            {
+                // Estimated once per render, on the full frame and before the
+                // gains. A mask's crop is handed the value already computed
+                // rather than deriving its own from a fragment of the picture,
+                // and because it is stored un-gained it stays correct even when
+                // the mask's own Exposure or white balance differ from the
+                // global ones — see Effects.Airlight.
+                airlight ??= Effects.EstimateAirlightFromSensor(src, w, h);
+                Effects.ApplyDehaze(rLin, gLin, bLin, w, h, s.Dehaze,
+                                    airlight.Value.Gained(gainR, gainG, gainB),
+                                    contextW, contextH, po);
+            }
+
+            if (doLocalHighlights)
+                LocalHighlights.Apply(rLin, gLin, bLin, w, h,
+                    new LocalHighlights.Options
+                    {
+                        Highlights = hl,
+                        Radius = LocalHighlights.RegionRadius(contextW, contextH),
+                    }, po);
+        }
+
         // ── Pass 0 (conditional): regional luminance plane for v3 sliders ──
-        // Build the post-gain Y plane, then run EdgeAwareLuma's guided filter
-        // to get evBase[i] = log2(Y_region / MiddleGray). v3 H/S/W/B read this
-        // for their masks; v4 Highlights uses it only for contextual recovery
-        // inside clipped highlight regions. Skipped entirely when every active
-        // relevant slider ignores evBase.
+        // Build the post-gain (and post-Pass-H, if any) Y plane, then run
+        // EdgeAwareLuma's guided filter to get evBase[i] = log2(Y_region /
+        // MiddleGray). v3 Shadows/Blacks read this for their masks.
+        // Skipped entirely when neither of those sliders is active.
         float[]? evBase = null;
-        double highlightDarkSceneBoost = 0.0;
         if (needsEvBase)
         {
             var yLinear = new float[n];
@@ -377,16 +714,21 @@ public static class DevelopProcessor
                 int srcIdx = rowI * 3;
                 for (int x = 0; x < w; x++)
                 {
-                    double lr = src[srcIdx]     * gainR * inv65535;
-                    double lg = src[srcIdx + 1] * gainG * inv65535;
-                    double lb = src[srcIdx + 2] * gainB * inv65535;
-                    yLinear[rowI + x] = (float)BasicTone.Luminance(lr, lg, lb);
+                    int i = rowI + x;
+                    double lr, lg, lb;
+                    if (needPlanes) { lr = rLin![i]; lg = gLin![i]; lb = bLin![i]; }
+                    else
+                    {
+                        lr = src[srcIdx]     * gainR * inv65535;
+                        lg = src[srcIdx + 1] * gainG * inv65535;
+                        lb = src[srcIdx + 2] * gainB * inv65535;
+                    }
+                    yLinear[i] = (float)BasicTone.Luminance(lr, lg, lb);
                     srcIdx += 3;
                 }
             });
-            if (hl != 0.0 && highlightsV == 4)
-                highlightDarkSceneBoost = EstimateHighlightDarkSceneBoost(yLinear, lut);
-            evBase = EdgeAwareLuma.BuildEvBase(yLinear, w, h, po);
+            evBase = EdgeAwareLuma.BuildEvBase(yLinear, w, h, po,
+                                               EdgeAwareLuma.RegionRadius(contextW, contextH));
         }
 
         // ── Pass 1: gain → EV tone → endpoints → LUT, decompose luma/chroma ──
@@ -400,50 +742,34 @@ public static class DevelopProcessor
             int srcIdx = rowI * 3;
             for (int x = 0; x < w; x++)
             {
+                int idx = rowI + x;
                 // Scene-linear, normalised so 1.0 = sensor saturation. Kept
                 // unclamped through the tone math so highlight detail above
                 // the old 65535 ceiling survives until Whites decides it.
-                double lr = src[srcIdx]     * gainR * inv65535;
-                double lg = src[srcIdx + 1] * gainG * inv65535;
-                double lb = src[srcIdx + 2] * gainB * inv65535;
+                // Reconstruction, the Exposure shoulder and Highlights, when
+                // active, are already baked into rLin/gLin/bLin (Pass H).
+                double lr, lg, lb;
+                if (needPlanes) { lr = rLin![idx]; lg = gLin![idx]; lb = bLin![idx]; }
+                else
+                {
+                    lr = src[srcIdx]     * gainR * inv65535;
+                    lg = src[srcIdx + 1] * gainG * inv65535;
+                    lb = src[srcIdx + 2] * gainB * inv65535;
+                }
 
-                // evB only used by v3 dispatchers; 0.0 is fine for v1/v2.
-                double evB = evBase != null ? evBase[rowI + x] : 0.0;
+                // evB only consulted by the v3 Shadows/Whites/Blacks masks.
+                double evB = evBase != null ? evBase[idx] : 0.0;
 
                 if (doEv)
                 {
-                    if (combinedHsl)
-                    {
-                        // Fast path: all of highlights/shadows/contrast on v1 ⇒
-                        // RAWR's original combined EV-space ratio. Byte-identical
-                        // to the pre-versioning render.
-                        BasicTone.ApplyHighlightShadowContrast(
-                            ref lr, ref lg, ref lb, hl, sh, contrastSlope);
-                    }
-                    else
-                    {
-                        // Mixed-version: per-slider passes, in pipeline order.
-                        if (hl != 0.0) BasicTone.ApplyHighlights(
-                            highlightsV, ref lr, ref lg, ref lb, hl, evB, highlightDarkSceneBoost);
-                        if (sh != 0.0) BasicTone.ApplyShadows(shadowsV, ref lr, ref lg, ref lb, sh, evB);
-                        if (co != 0.0) BasicTone.ApplyContrast(contrastV, ref lr, ref lg, ref lb, co, contrastSlope);
-                    }
+                    if (sh != 0.0) BasicTone.ApplyShadows(ref lr, ref lg, ref lb, sh, evB);
+                    if (co != 0.0) BasicTone.ApplyContrast(ref lr, ref lg, ref lb, co);
                 }
 
                 if (doEnds)
                 {
-                    if (combinedEnds)
-                    {
-                        // Fast path: both endpoints on v1 ⇒ original combined remap.
-                        lr = (lr - blackLin) * invSpan;
-                        lg = (lg - blackLin) * invSpan;
-                        lb = (lb - blackLin) * invSpan;
-                    }
-                    else
-                    {
-                        if (wh != 0.0) BasicTone.ApplyWhites(whitesV, ref lr, ref lg, ref lb, wh, evB);
-                        if (bk != 0.0) BasicTone.ApplyBlacks(blacksV, ref lr, ref lg, ref lb, bk, evB);
-                    }
+                    if (wh != 0.0) BasicTone.ApplyWhites(ref lr, ref lg, ref lb, wh);
+                    if (bk != 0.0) BasicTone.ApplyBlacks(ref lr, ref lg, ref lb, bk, evB);
                 }
 
                 int ir = (int)(lr * 65535.0 + 0.5);
@@ -457,17 +783,35 @@ public static class DevelopProcessor
                 float pg = lut[ig];
                 float pb = lut[ib];
                 float y = 0.2126f * pr + 0.7152f * pg + 0.0722f * pb;
-                int i = rowI + x;
-                luma[i] = y;
-                cb[i] = pb - y;
-                cr[i] = pr - y;
+                luma[idx] = y;
+                cb[idx] = pb - y;
+                cr[idx] = pr - y;
                 srcIdx += 3;
             }
         });
 
-        // ── Chroma denoise: separable 5-tap box on the colour planes only ──
-        BoxBlurSeparable(cb, w, h, 2, po);
-        BoxBlurSeparable(cr, w, h, 2, po);
+        // ── Detail: noise reduction, then sharpening ──
+        // Chroma first — this is the box blur that used to be hard-coded here at
+        // radius 2, now the Colour slider, which reproduces exactly that at its
+        // default. Luminance NR precedes sharpening so the unsharp mask is not
+        // handed grain to amplify.
+        Detail.ReduceColorNoise(cb, cr, w, h, s.ColorNoiseReduction, po);
+
+        var luminanceNr = Detail.BuildLuminance(
+            s.LuminanceNoiseReduction, s.LuminanceNoiseDetail, s.LuminanceNoiseContrast);
+        Detail.ReduceLuminanceNoise(luma, w, h, luminanceNr, po);
+
+        // Texture then Clarity — fine scale before broad, so Clarity's base sees
+        // whatever Texture decided the detail should be. Both precede sharpening
+        // for the same reason noise reduction does: the unsharp mask should be
+        // the last thing to touch the luminance, not be handed micro-contrast
+        // that another operator has just amplified.
+        Effects.ApplyTexture(luma, w, h, s.Texture, contextW, contextH, po);
+        Effects.ApplyClarity(luma, w, h, s.Clarity, contextW, contextH, po);
+
+        var sharpen = Detail.BuildSharpen(
+            s.Sharpening, s.SharpenRadius, s.SharpenDetail, s.SharpenMasking);
+        Detail.Sharpen(luma, w, h, sharpen, po);
 
         return (w, h, luma, cb, cr);
     }
@@ -492,90 +836,4 @@ public static class DevelopProcessor
         return lut;
     }
 
-    /// <summary>
-    /// Lightroom's Highlights slider becomes much more global on dark frames
-    /// with substantial clipped/highlight content. The set-3 calibration case
-    /// shows this clearly: even rendered near-black pixels move by ~0.45 EV at
-    /// Highlights -100, while normal set-2 images only need the gentler broad
-    /// v4 curve. Estimate that scene class from the neutral rendered luma
-    /// distribution so the extra v4 dark-scene term only engages where the
-    /// calibration data says LR behaves this way.
-    /// </summary>
-    private static double EstimateHighlightDarkSceneBoost(float[] yLinear, float[] displayLut)
-    {
-        int n = yLinear.Length;
-        if (n == 0) return 0.0;
-
-        int deepBlack = 0;
-        double sumDisplayLin = 0.0;
-        const double inv255 = 1.0 / 255.0;
-
-        for (int i = 0; i < n; i++)
-        {
-            double y = yLinear[i];
-            int iy = (int)(y * 65535.0 + 0.5);
-            if (iy < 0) iy = 0; else if (iy > 65535) iy = 65535;
-
-            // The comparison scripts linearise Adobe RGB exports with gamma
-            // ≈2.2, so use the same style of display-linear proxy here.
-            double yd = Math.Pow(displayLut[iy] * inv255, 2.19921875);
-            sumDisplayLin += yd;
-            if (yd <= 0.003) deepBlack++;
-        }
-
-        double blackFrac = (double)deepBlack / n;
-        double meanDisplayLin = sumDisplayLin / n;
-
-        double darkMass = BasicTone.SmoothStep(0.05, 0.45, blackFrac);
-        double lowMean = 1.0 - BasicTone.SmoothStep(0.25, 0.50, meanDisplayLin);
-        double boost = darkMass * lowMean;
-        return boost < 0.0 ? 0.0 : boost > 1.0 ? 1.0 : boost;
-    }
-
-    // Sliding-window box blur, horizontal then vertical, edges clamp-extend.
-    private static void BoxBlurSeparable(float[] plane, int w, int h, int radius, ParallelOptions po)
-    {
-        int taps = radius * 2 + 1;
-        float inv = 1f / taps;
-        var tmp = new float[plane.Length];
-
-        Parallel.For(0, h, po, y =>
-        {
-            int row = y * w;
-            float sum = 0f;
-            for (int k = -radius; k <= radius; k++)
-            {
-                int xc = k < 0 ? 0 : k >= w ? w - 1 : k;
-                sum += plane[row + xc];
-            }
-            for (int x = 0; x < w; x++)
-            {
-                tmp[row + x] = sum * inv;
-                int addX = x + radius + 1;
-                int subX = x - radius;
-                if (addX > w - 1) addX = w - 1;
-                if (subX < 0) subX = 0;
-                sum += plane[row + addX] - plane[row + subX];
-            }
-        });
-
-        Parallel.For(0, w, po, x =>
-        {
-            float sum = 0f;
-            for (int k = -radius; k <= radius; k++)
-            {
-                int yc = k < 0 ? 0 : k >= h ? h - 1 : k;
-                sum += tmp[yc * w + x];
-            }
-            for (int y = 0; y < h; y++)
-            {
-                plane[y * w + x] = sum * inv;
-                int addY = y + radius + 1;
-                int subY = y - radius;
-                if (addY > h - 1) addY = h - 1;
-                if (subY < 0) subY = 0;
-                sum += tmp[addY * w + x] - tmp[subY * w + x];
-            }
-        });
-    }
 }

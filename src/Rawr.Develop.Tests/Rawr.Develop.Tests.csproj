@@ -1,9 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <!-- Targets net9.0-windows to match Rawr.Develop (WPF). The tests only
-       exercise the pure BasicTone math, so no UseWPF is needed here. -->
+  <!-- Targets net9.0-windows to match Rawr.Develop (WPF). UseWPF is on because
+       MaskTests renders through DevelopProcessor, whose output is a BitmapSource;
+       no window is created, only the imaging types. -->
   <PropertyGroup>
     <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>

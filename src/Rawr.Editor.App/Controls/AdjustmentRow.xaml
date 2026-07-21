@@ -2,72 +2,80 @@
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Name="Root"
-             Margin="0,5">
+             Margin="0,3,0,9">
+    <!-- Two-line layout, as Lightroom does it: the caption line carries the label
+         on the left and the readout on the right, and the slider gets the whole
+         width underneath. Sharing one line with the readout cost the track ~90px,
+         which is exactly the resolution you want back when fine-tuning. -->
     <Grid>
-        <!-- Column 3 is always reserved for the version pill, even on rows
-             that don't have versions (Exposure, Highlights). That way every
-             slider in the panel lines up at the same right edge regardless
-             of which rows happen to expose a v1/v2/… toggle. -->
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="78" />
-            <ColumnDefinition Width="*" />
-            <ColumnDefinition Width="50" />
-            <ColumnDefinition Width="40" />
-        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
 
-        <TextBlock Grid.Column="0"
-                   Text="{Binding Label, ElementName=Root}"
-                   Foreground="{StaticResource TextDimBrush}"
-                   VerticalAlignment="Center" />
+        <Grid Grid.Row="0" Margin="0,0,0,1">
+            <!-- The unit column holds its width even on rows without a pill, so
+                 every readout in the panel lines up at the same right edge —
+                 which is also the right edge of the track below it. -->
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="52" />
+            </Grid.ColumnDefinitions>
 
-        <Slider Grid.Column="1"
+            <TextBlock Grid.Column="0"
+                       Text="{Binding Label, ElementName=Root}"
+                       Foreground="{StaticResource TextDimBrush}"
+                       VerticalAlignment="Center" />
+
+            <!-- Unit toggle. Hidden (not collapsed) on rows without alternate units
+                 so the reserved column still holds layout. Click flips
+                 IsAlternateUnit, which the view-model turns into a real unit change
+                 (e.g. Temp switching between relative and absolute Kelvin). -->
+            <Button Grid.Column="1"
+                    x:Name="PART_UnitButton"
+                    Content="{Binding CurrentUnitText, ElementName=Root}"
+                    Click="OnUnitClick"
+                    MinWidth="24"
+                    Padding="4,0"
+                    Margin="0,0,6,0"
+                    FontSize="11"
+                    Visibility="{Binding HasUnitToggle, ElementName=Root,
+                                         Converter={StaticResource HiddenVis}}"
+                    ToolTip="{Binding UnitToolTip, ElementName=Root}" />
+
+            <TextBox Grid.Column="2"
+                     x:Name="PART_ValueBox"
+                     Height="20"
+                     Padding="3,0"
+                     HorizontalAlignment="Stretch"
+                     VerticalAlignment="Center"
+                     HorizontalContentAlignment="Right"
+                     VerticalContentAlignment="Center"
+                     FontFamily="Consolas"
+                     Background="{StaticResource BgControlBrush}"
+                     Foreground="{StaticResource TextBrush}"
+                     BorderBrush="{StaticResource BorderBrush}"
+                     BorderThickness="1"
+                     CaretBrush="{StaticResource TextBrush}"
+                     GotKeyboardFocus="OnValueBoxGotKeyboardFocus"
+                     LostKeyboardFocus="OnValueBoxLostKeyboardFocus"
+                     PreviewKeyDown="OnValueBoxPreviewKeyDown"
+                     PreviewMouseLeftButtonDown="OnValueBoxPreviewMouseLeftButtonDown"
+                     ToolTip="Type a value and press Enter" />
+        </Grid>
+
+        <!-- The slider always runs in POSITION space, 0…1, never in the row's own
+             units — that is what lets Temp lay Kelvin out logarithmically (see
+             SliderScales). Code-behind converts in both directions and keeps the
+             two in step; binding Value straight through would force a linear
+             layout and fight the conversion. -->
+        <Slider Grid.Row="1"
                 x:Name="PART_Slider"
                 Style="{StaticResource AdjustmentSlider}"
-                Minimum="{Binding Minimum, ElementName=Root}"
-                Maximum="{Binding Maximum, ElementName=Root}"
-                SmallChange="{Binding Step, ElementName=Root}"
-                LargeChange="{Binding Step, ElementName=Root}"
-                Value="{Binding Value, ElementName=Root, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                Minimum="0"
+                Maximum="1"
                 VerticalAlignment="Center"
-                Margin="8,0"
                 ToolTip="Double-click to reset" />
-
-        <TextBox Grid.Column="2"
-                 x:Name="PART_ValueBox"
-                 Height="22"
-                 Padding="3,0"
-                 HorizontalAlignment="Stretch"
-                 VerticalAlignment="Center"
-                 HorizontalContentAlignment="Right"
-                 VerticalContentAlignment="Center"
-                 FontFamily="Consolas"
-                 Background="{StaticResource BgControlBrush}"
-                 Foreground="{StaticResource TextBrush}"
-                 BorderBrush="{StaticResource BorderBrush}"
-                 BorderThickness="1"
-                 CaretBrush="{StaticResource TextBrush}"
-                 GotKeyboardFocus="OnValueBoxGotKeyboardFocus"
-                 LostKeyboardFocus="OnValueBoxLostKeyboardFocus"
-                 PreviewKeyDown="OnValueBoxPreviewKeyDown"
-                 PreviewMouseLeftButtonDown="OnValueBoxPreviewMouseLeftButtonDown"
-                 ToolTip="Type a value and press Enter" />
-
-        <!-- Math-version cycle button. Hidden (not collapsed) on rows without
-             multiple versions so the reserved column still holds layout. Click
-             advances 1→2→…→N→1. ContentStringFormat is used instead of the
-             binding's StringFormat because Button.Content is typed `object`,
-             and StringFormat on object-typed bindings is unreliable. -->
-        <Button Grid.Column="3"
-                x:Name="PART_VersionButton"
-                Content="{Binding Version, ElementName=Root}"
-                ContentStringFormat="v{0}"
-                Click="OnVersionClick"
-                HorizontalAlignment="Stretch"
-                Padding="0,1"
-                Margin="6,0,0,0"
-                FontSize="11"
-                Visibility="{Binding HasVersions, ElementName=Root,
-                                     Converter={StaticResource HiddenVis}}"
-                ToolTip="Click to cycle through math versions for this slider" />
     </Grid>
 </UserControl>

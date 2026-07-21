@@ -28,19 +28,32 @@ public static class EdgeAwareLuma
     public const float Epsilon = 0.25f;
 
     /// <summary>
+    /// The guided-filter radius for an image of the given size: 1/16 of the
+    /// short edge — large enough to be "regional" (smooths over texture, picks
+    /// up the brightness of the area a pixel sits in) yet small enough not to
+    /// leak across major composition boundaries.
+    ///
+    /// <para>Public because a caller rendering a <i>crop</i> — which is what a
+    /// masked local adjustment does — must pass the radius the <b>whole</b>
+    /// image would have used. Letting the crop derive its own would make the
+    /// same pixel "regional" over a smaller neighbourhood inside the mask than
+    /// outside it, and the v3 Shadows/Blacks masks would then disagree across
+    /// the mask boundary — a visible seam produced entirely by the tiling.</para>
+    /// </summary>
+    public static int RegionRadius(int w, int h) => Math.Max(8, Math.Min(w, h) / 16);
+
+    /// <summary>
     /// Build the regional-luminance plane (EV relative to middle grey) from a
     /// linear luminance buffer that has already been gained (post-WB / post-
     /// exposure). Self-guided filter in log2-EV space; radius scales with the
     /// short edge so the same regional behaviour shows up at preview and
     /// full-resolution export resolutions.
     /// </summary>
-    public static float[] BuildEvBase(float[] yLinear, int w, int h, ParallelOptions po)
+    public static float[] BuildEvBase(float[] yLinear, int w, int h, ParallelOptions po,
+                                      int radius = 0)
     {
         int n = w * h;
-        // 1/16 of the short edge: large enough to be "regional" (smooths over
-        // texture, picks up the brightness of the area a pixel sits in) yet
-        // small enough not to leak across major composition boundaries.
-        int radius = Math.Max(8, Math.Min(w, h) / 16);
+        if (radius <= 0) radius = RegionRadius(w, h);
         const float lumaFloor = 1e-6f;
         float midGray = (float)BasicTone.MiddleGray;
 
@@ -92,9 +105,9 @@ public static class EdgeAwareLuma
 
     /// <summary>
     /// Sliding-window separable box blur, clamp-extend edges. Same algorithm as
-    /// <c>DevelopProcessor.BoxBlurSeparable</c>; kept local so this module is
-    /// self-contained and the guided filter can choose its own radius without
-    /// coupling to the chroma denoise step.
+    /// <see cref="LocalHighlights"/>'s and <see cref="Detail"/>'s; kept local so
+    /// this module is self-contained and the guided filter can choose its own
+    /// radius without coupling to the noise-reduction step.
     /// </summary>
     private static void BoxBlur(float[] src, float[] dst, int w, int h, int radius, ParallelOptions po)
     {

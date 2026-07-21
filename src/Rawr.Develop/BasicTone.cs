@@ -223,108 +223,7 @@ public static class BasicTone
         return LrMatchLut[i] * (1.0 - f) + LrMatchLut[i + 1] * f;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //                         VERSIONED SLIDER MATH
-    // ═══════════════════════════════════════════════════════════════════════
-    //
-    // Each non-trivial tone slider exposes a SwitchVersion(int, ...) dispatcher
-    // and per-version implementations. Version 1 is RAWR's original math (see
-    // the V1 helpers below — they apply the slider in isolation, equivalent to
-    // ApplyHighlightShadowContrast / endpoint remap when the other relevant
-    // sliders are zero). Version 2 is the darktable-style alternative model.
-    //
-    // To add a v3 of any slider:
-    //   1. Bump <Slider>VersionCount by one.
-    //   2. Add an ApplyXxxV3 method below.
-    //   3. Add a `case 3:` branch in the matching ApplyXxx dispatcher.
-    // The UI auto-discovers the new version count via the DevelopSettings
-    // helpers further down — no XAML changes needed.
-
-    public const int ContrastVersionCount    = 2;
-    public const int HighlightsVersionCount  = 4;
-    public const int ShadowsVersionCount     = 3;
-    public const int WhitesVersionCount      = 3;
-    public const int BlacksVersionCount      = 3;
-
-    // ── V1 "alone" helpers ────────────────────────────────────────────────
-    // These run the v1 math for a single slider, used when another slider is
-    // on a different version so the combined ApplyHighlightShadowContrast /
-    // combined endpoint remap fast path no longer applies.
-
-    public static void ApplyHighlightsV1(ref double r, ref double g, ref double b, double highlights)
-    {
-        if (highlights == 0.0) return;
-        double y = Luminance(r, g, b);
-        if (y < LumaEps) return;
-        double ev = Math.Log2(y / MiddleGray);
-        double mask = SmoothStep(0.0, 3.0, ev);
-        double newEv = ev + highlights / 100.0 * HighlightStrength * mask;
-        double ratio = LumaFromEv(newEv) / y;
-        r *= ratio; g *= ratio; b *= ratio;
-    }
-
-    public static void ApplyShadowsV1(ref double r, ref double g, ref double b, double shadows)
-    {
-        if (shadows == 0.0) return;
-        double y = Luminance(r, g, b);
-        if (y < LumaEps) return;
-        double ev = Math.Log2(y / MiddleGray);
-        double mask = 1.0 - SmoothStep(-4.0, 0.0, ev);
-        double newEv = ev + shadows / 100.0 * ShadowStrength * mask;
-        double ratio = LumaFromEv(newEv) / y;
-        r *= ratio; g *= ratio; b *= ratio;
-    }
-
-    public static void ApplyContrastV1(ref double r, ref double g, ref double b, double contrastSlope)
-    {
-        if (contrastSlope == 1.0) return;
-        double y = Luminance(r, g, b);
-        if (y < LumaEps) return;
-        double ev = Math.Log2(y / MiddleGray);
-        double ratio = LumaFromEv(ev * contrastSlope) / y;
-        r *= ratio; g *= ratio; b *= ratio;
-    }
-
-    /// <summary>v1 Whites in isolation: endpoint remap with the black point fixed at 0 ⇒ lr / WhiteLin.</summary>
-    public static void ApplyWhitesV1(ref double r, ref double g, ref double b, double whites)
-    {
-        if (whites == 0.0) return;
-        double inv = 1.0 / WhiteLin(whites);
-        r *= inv; g *= inv; b *= inv;
-    }
-
-    /// <summary>v1 Blacks in isolation: endpoint remap with the white point fixed at 1 ⇒ (lr − BlackLin) / (1 − BlackLin).</summary>
-    public static void ApplyBlacksV1(ref double r, ref double g, ref double b, double blacks)
-    {
-        if (blacks == 0.0) return;
-        double bl = BlackLin(blacks);
-        double inv = 1.0 / (1.0 - bl);
-        r = (r - bl) * inv;
-        g = (g - bl) * inv;
-        b = (b - bl) * inv;
-    }
-
-    // ── V2 (darktable-inspired) ───────────────────────────────────────────
-
-    /// <summary>
-    /// Highlights v2: tone-equalizer-style EV pull gated by a smoothstep on
-    /// luminance (full effect from y≈0.85 up, zero by y≈0.35). Negative slider
-    /// pulls highlights down, positive pushes them up. Strength ±2 EV at
-    /// slider extremes — meaningfully stronger than the v1 ±1 EV.
-    /// </summary>
-    public const double HighlightsV2Stops = 2.0;
-    public const double HighlightsV2MaskLo = 0.35;
-    public const double HighlightsV2MaskHi = 0.85;
-    public static void ApplyHighlightsV2(ref double r, ref double g, ref double b, double highlights)
-    {
-        if (highlights == 0.0) return;
-        double y = Luminance(r, g, b);
-        if (y < LumaEps) return;
-        double mask = SmoothStep(HighlightsV2MaskLo, HighlightsV2MaskHi, y);
-        if (mask <= 0.0) return;
-        double gain = Math.Pow(2.0, (highlights / 100.0) * HighlightsV2Stops * mask);
-        r *= gain; g *= gain; b *= gain;
-    }
+    // ── V2 (darktable-inspired Contrast) ────────────────────────────────────
 
     /// <summary>
     /// Contrast v2: darktable's hue-preserving luminance power curve about
@@ -344,63 +243,6 @@ public static class BasicTone
         r *= ratio; g *= ratio; b *= ratio;
     }
 
-    /// <summary>
-    /// Shadows v2: tone-equalizer-style EV lift gated by a smoothstep on
-    /// luminance (full effect at y=0, zero by y=0.45). Positive opens shadows,
-    /// negative crushes them. Strength ±2 EV at slider extremes.
-    /// </summary>
-    public const double ShadowsV2Stops = 2.0;
-    public const double ShadowsV2MaskLo = 0.0;
-    public const double ShadowsV2MaskHi = 0.45;
-    public static void ApplyShadowsV2(ref double r, ref double g, ref double b, double shadows)
-    {
-        if (shadows == 0.0) return;
-        double y = Luminance(r, g, b);
-        if (y < LumaEps) return;
-        double mask = 1.0 - SmoothStep(ShadowsV2MaskLo, ShadowsV2MaskHi, y);
-        if (mask <= 0.0) return;
-        double gain = Math.Pow(2.0, (shadows / 100.0) * ShadowsV2Stops * mask);
-        r *= gain; g *= gain; b *= gain;
-    }
-
-    /// <summary>
-    /// Whites v2: smooth high-tone EV mask (no hard endpoint clip). Positive
-    /// pushes the brightest band toward clipping; negative protects highlights.
-    /// Mask ramps in over y=0.75..1.0, strength ±1.5 EV.
-    /// </summary>
-    public const double WhitesV2Stops = 1.5;
-    public const double WhitesV2MaskLo = 0.75;
-    public const double WhitesV2MaskHi = 1.0;
-    public static void ApplyWhitesV2(ref double r, ref double g, ref double b, double whites)
-    {
-        if (whites == 0.0) return;
-        double y = Luminance(r, g, b);
-        if (y < LumaEps) return;
-        double mask = SmoothStep(WhitesV2MaskLo, WhitesV2MaskHi, y);
-        if (mask <= 0.0) return;
-        double gain = Math.Pow(2.0, (whites / 100.0) * WhitesV2Stops * mask);
-        r *= gain; g *= gain; b *= gain;
-    }
-
-    /// <summary>
-    /// Blacks v2: smooth low-tone EV mask (no hard black-point shift).
-    /// Positive lifts the deepest band; negative crushes it. Mask falls from
-    /// y=0 (full) to y=0.35 (none), strength ±1.5 EV.
-    /// </summary>
-    public const double BlacksV2Stops = 1.5;
-    public const double BlacksV2MaskLo = 0.0;
-    public const double BlacksV2MaskHi = 0.35;
-    public static void ApplyBlacksV2(ref double r, ref double g, ref double b, double blacks)
-    {
-        if (blacks == 0.0) return;
-        double y = Luminance(r, g, b);
-        if (y < LumaEps) return;
-        double mask = 1.0 - SmoothStep(BlacksV2MaskLo, BlacksV2MaskHi, y);
-        if (mask <= 0.0) return;
-        double gain = Math.Pow(2.0, (blacks / 100.0) * BlacksV2Stops * mask);
-        r *= gain; g *= gain; b *= gain;
-    }
-
     // ── V3 (edge-aware) ───────────────────────────────────────────────────
     //
     // Read evBase = log2(Y_region / MiddleGray) from <see cref="EdgeAwareLuma"/>,
@@ -410,21 +252,6 @@ public static class BasicTone
     // bit that makes these sliders feel like Lightroom's: stronger gain (±3.5 EV
     // for H/S, ±2.5 for W/B) is safe to apply because the regional mask keeps
     // it from flattening the image or producing halos.
-
-    public const double HighlightsV3Stops    =  3.5;
-    public const double HighlightsV3MaskLoEv = -0.5;
-    public const double HighlightsV3MaskHiEv =  3.5;
-    public static void ApplyHighlightsV3(ref double r, ref double g, ref double b,
-                                         double highlights, double evBase)
-    {
-        if (highlights == 0.0) return;
-        double mask = SmoothStep(HighlightsV3MaskLoEv, HighlightsV3MaskHiEv, evBase);
-        if (mask <= 0.0) return;
-        double y = Luminance(r, g, b);
-        if (y < LumaEps) return;
-        double gain = Math.Pow(2.0, (highlights / 100.0) * HighlightsV3Stops * mask);
-        r *= gain; g *= gain; b *= gain;
-    }
 
     public const double ShadowsV3Stops    =  3.5;
     public const double ShadowsV3MaskLoEv = -4.5;
@@ -471,241 +298,139 @@ public static class BasicTone
         r *= gain; g *= gain; b *= gain;
     }
 
-    // ── V4 (Lightroom-calibrated highlights) ──────────────────────────────
-    //
-    // Calibrated against a measured LR-vs-RAWR battery. The decisive run was a
-    // delta-vs-delta comparison on a well-exposed frame (set 2): LR's own
-    // baseline→edit profile vs RAWR's, band by band in scene-linear EV. That
-    // exposed the shape — not just the strength — of LR's Highlights:
-    //
-    //   1. Broad, per-pixel reach. On a normal image −100 bends the WHOLE
-    //      tonal range (near-black −0.10 → lower-mid −0.24), not just the
-    //      bright band. The v3-style *regional* evBase mask was wrong here and
-    //      caused the largest error, so v4 keys off the pixel's own luminance.
-    //   2. A gentle plateau plus a lights peak, then HARD top protection. LR
-    //      holds a flat ~−0.22 (at −100) pull across shadows→mids and adds a
-    //      hump that peaks in the lights (−0.43), then collapses to ~0 by
-    //      near-white (−0.014). Modelled as (broad·rise + peak·gauss)·protect:
-    //      a flat broad term, a Gaussian centred on the lights, and a sharp
-    //      rolloff in the last ~0.2 EV before clipping. A single envelope
-    //      over-pulled the mids by ~0.2 EV — the split tracks the measured
-    //      plateau-then-hump shape.
-    //   3. Linear in slider. −50 ≈ ½·−100, +50 ≈ ½·+100 — a plain (slider/100)
-    //      scale, no curve-per-amount.
-    //   4. Asymmetric. Negative is ~1.7× the positive push on this clean
-    //      image; the ratio widens to 10×+ on dark/clipped scenes because the
-    //      blown-recovery term (below) only adds to the negative side.
-    //   5. Clipping-aware recovery. Genuinely blown pixels (very high ev) get
-    //      a large extra pull — the −3…−4 EV the clipped scene needed — added
-    //      *past* the protect rolloff and gated to clipped ev only, so it
-    //      cannot lift the protected near-white of a non-clipped image.
-    //      A second contextual term reads evBase: if a pixel sits inside a
-    //      clipped highlight region but its own luma is not clipped, it still
-    //      gets part of LR's recovery. This is what the dark/clipped calibration
-    //      frames need; their recovered highlight regions land in displayed
-    //      midtones, so a purely per-pixel display-luma mask misses them.
-    //   6. Mild chroma coupling. Recovery slightly raises saturation, push
-    //      slightly lowers it; tied to the (now bounded) EV move so it can no
-    //      longer blow up at the top the way the first v4 did.
-    //
-    // Strength constants are pinned to set 2's high-confidence lights peak;
-    // the blown/contextual recovery constants are carried from the
-    // dark/clipped battery and should be refined as more re-exports are added.
+    // ── Soft knee: the shared shape for every top-end operator ─────────────
 
-    public const double HighlightsV4RiseLoEv     = -7.0;  // broad term ramps in from deep shadow…
-    public const double HighlightsV4RiseHiEv     = -1.0;  // …flat plateau by the shadows and up
-    public const double HighlightsV4ProtectLoEv  =  2.30; // top protection starts (~y 0.88)
-    public const double HighlightsV4ProtectHiEv  =  2.48; // …complete just below clipping
-    public const double HighlightsV4RecoverBroad =  0.22; // −100 flat plateau pull (shadows→mids)
-    public const double HighlightsV4RecoverPeak  =  0.50; // −100 extra Gaussian hump at the lights
-    public const double HighlightsV4PeakEv       =  1.95; // hump centre (the lights band)
-    public const double HighlightsV4PeakWidthEv  =  0.55; // hump half-width (EV)
-    public const double HighlightsV4PushStops    =  0.42; // +100 EV lift, still weaker than recovery
-    public const double HighlightsV4BlowLoEv     =  2.4;  // blown-recovery boost engages here…
-    public const double HighlightsV4BlowHiEv     =  4.5;  // …saturating for deeply clipped detail
-    public const double HighlightsV4BlowStops    =  3.5;  // extra EV pull for genuinely clipped pixels
-    public const double HighlightsV4ContextLoEv  =  2.1;  // regional clipped-highlight recovery starts…
-    public const double HighlightsV4ContextHiEv  =  3.8;  // …and saturates in very bright regions
-    public const double HighlightsV4ContextStops =  1.8;  // extra EV pull for non-clipped pixels in blown regions
-    public const double HighlightsV4DarkRecoverBase = 0.45; // dark/clipped scenes: whole-frame base pull
-    public const double HighlightsV4DarkRecoverLow  = 0.35; // extra pull into shadows/lower mids
-    public const double HighlightsV4DarkRecoverHigh = 0.95; // strong pull through mids/highlights
-    public const double HighlightsV4DarkRecoverTop  = 0.75; // final top-end recovery lift
-    public const double HighlightsV4DarkPushBase    = 0.25; // dark/clipped scenes: whole-frame base lift
-    public const double HighlightsV4DarkPushMid     = 0.55; // extra lift through shadows/lower mids
-    public const double HighlightsV4DarkPushRollLo  = 0.65; // positive side rolls off before the top
-    public const double HighlightsV4DarkPushRollHi  = 1.00;
-    public const double HighlightsV4ChromaRecover=  0.12; // saturation gain per EV of recovery pull
-    public const double HighlightsV4ChromaPush   =  0.10; // saturation loss per EV of positive push
-    public const double HighlightsV4MaxChroma    =  1.80; // clamp on the chroma factor
-
-    public static void ApplyHighlightsV4(ref double r, ref double g, ref double b,
-                                         double highlights, double evBase,
-                                         double darkSceneBoost = 0.0)
+    /// <summary>
+    /// Soft knee in EV space: identity for <paramref name="d"/> ≤ 0, tending to
+    /// <paramref name="slope"/>·d for large d, with matching value <i>and</i> slope
+    /// at d = 0 so there is no crease where the affected band begins.
+    ///
+    /// <para>d′ = s·d + (1−s)·w·(1 − e^(−d/w)). At d = 0 the derivative is
+    /// s + (1−s) = 1 for any s, which is what buys the C¹ join; as d grows the
+    /// exponential saturates and the derivative falls to s. Works unchanged for
+    /// s &gt; 1 (expansion), where the correction term is negative.</para>
+    ///
+    /// <para>Highlights, Whites and the Exposure shoulder are all this one curve
+    /// with different anchors and slopes — which is what makes them compose
+    /// predictably instead of fighting each other.</para>
+    /// </summary>
+    public static double SoftKnee(double d, double slope, double width)
     {
-        if (highlights == 0.0) return;
+        if (d <= 0.0) return d;
+        if (width < 1e-6) width = 1e-6;
+        return slope * d + (1.0 - slope) * width * (1.0 - Math.Exp(-d / width));
+    }
 
+    // ── V4: global top-end operators (Whites, Exposure shoulder) ───────────
+    //
+    // Both are deliberately GLOBAL — per-pixel luminance, no evBase. That is the
+    // difference in feel between Whites and Highlights: Highlights is regional and
+    // adaptive (a bright pixel in a dark region is left alone), whereas Whites is
+    // an endpoint control that moves every bright pixel in the frame regardless of
+    // what surrounds it. Reading evBase here, as v3 did, turned Whites into a
+    // second Highlights and left isolated speculars untouched.
+    //
+    // Both are calibrated against the range this pipeline's output transform
+    // actually has. DisplayCurve∘LightroomMatch renders middle grey at ~190/255 and
+    // maps +2 EV to ~250/255, so the whole visible highlight range is about two
+    // stops wide; constants tuned for a conventional curve (white at linear 1.0)
+    // would move the render by a couple of code values and feel inert.
+
+    // How far Whites can travel is set by the asymptote of the soft knee, which
+    // sits at knee + (1−slope)·width. Anything the slider does has to fit between
+    // that floor and where the tone started, and this output transform gives it
+    // very little to work with: it maps linear 0.20…1.00 — two and a third stops —
+    // into just 198…255. A knee at +0.5 EV with width 0.8 puts the floor at ~240,
+    // so Whites −100 could only ever move the brightest tone by fifteen code
+    // values out of 255, which reads as the slider doing nothing at all.
+    //
+    // These constants place the floor near 217/255 instead, giving the slider a
+    // ~33-value reach at the top — comparable to Highlights, which is also their
+    // relationship in Lightroom — while leaving everything below ~198/255 exactly
+    // alone. The knee cannot go much higher without the floor swallowing the
+    // slider's whole range again.
+
+    /// <summary>Where Whites starts to act, in stops above middle grey. ≈195/255.</summary>
+    public const double WhitesKneeEv   = 0.1;
+    public const double WhitesWidthEv  = 0.42;
+    /// <summary>Slope at Whites −100: pulls the extreme top down toward the knee.</summary>
+    public const double WhitesMinSlope = 0.05;
+    /// <summary>Slope at Whites +100: expands the top end and drives it into the clip.</summary>
+    public const double WhitesMaxSlope = 2.2;
+
+    /// <summary>
+    /// Whites as a white-point control: a slope change on the top end, pivoting at
+    /// <see cref="WhitesKneeEv"/> so midtones stay exactly put. Negative pulls the
+    /// brightest tones back down the output range (≈255→222, tapering to nothing by
+    /// ≈198); positive expands them and drives them into the clip.
+    ///
+    /// <para>Comparable in strength to Highlights but different in character, which
+    /// is what keeps the two sliders worth having separately: Whites is global and
+    /// flattens what it compresses, while Highlights is regional and splits detail
+    /// off so it survives. Whites moves an isolated specular in a dark frame;
+    /// Highlights, reading the region, leaves it alone.</para>
+    ///
+    /// <para>The slider interpolates the slope <i>geometrically</i>. Slope is a
+    /// multiplicative quantity, so a linear ramp bunches almost all of the effect
+    /// into the last third of the travel — at −50 a linear ramp gives a third of
+    /// the movement a geometric one does.</para>
+    /// </summary>
+    public static void ApplyWhitesV4(ref double r, ref double g, ref double b, double whites)
+    {
+        if (whites == 0.0) return;
         double y = Luminance(r, g, b);
         if (y < LumaEps) return;
 
         double ev = Math.Log2(y / MiddleGray);
+        double d = ev - WhitesKneeEv;
+        if (d <= 0.0) return;                 // below the knee ⇒ bit-exact no-op
 
-        // Broad envelope: ramps in from deep shadow to a flat plateau by the
-        // shadows. Zero in the deep shadow ⇒ nothing to do.
-        double rise = SmoothStep(HighlightsV4RiseLoEv, HighlightsV4RiseHiEv, ev);
-        if (rise <= 0.0) return;
-        double protect = 1.0 - SmoothStep(HighlightsV4ProtectLoEv, HighlightsV4ProtectHiEv, ev);
+        double k = Math.Clamp(Math.Abs(whites) / 100.0, 0.0, 1.0);
+        double slope = Math.Pow(whites < 0.0 ? WhitesMinSlope : WhitesMaxSlope, k);
 
-        double s = highlights / 100.0;             // −1 … +1, linear
-        double deltaEv;
-        double darkScene = darkSceneBoost < 0.0 ? 0.0 : darkSceneBoost > 1.0 ? 1.0 : darkSceneBoost;
-
-        if (s < 0.0)
-        {
-            // Recovery = (flat plateau + Gaussian hump at the lights), top-
-            // protected, PLUS an un-protected boost that only engages for
-            // genuinely clipped pixels — so blown detail is pulled hard while
-            // non-clipped near-white stays protected.
-            double pk = (ev - HighlightsV4PeakEv) / HighlightsV4PeakWidthEv;
-            double peak = Math.Exp(-pk * pk);
-            double protectedStops =
-                HighlightsV4RecoverBroad * rise + HighlightsV4RecoverPeak * peak;
-            double blow = SmoothStep(HighlightsV4BlowLoEv, HighlightsV4BlowHiEv, ev);
-
-            // Contextual recovery: only the portion not already explained by
-            // the pixel's own clipped luma is added. It remains top-protected
-            // for non-clipped pixels, while truly clipped pixels still use the
-            // stronger unprotected local `blow` term above.
-            double context = SmoothStep(HighlightsV4ContextLoEv, HighlightsV4ContextHiEv, evBase);
-            double contextOnly = context > blow ? context - blow : 0.0;
-
-            deltaEv = s * (
-                protectedStops * protect
-                + HighlightsV4BlowStops * blow
-                + HighlightsV4ContextStops * contextOnly * protect);
-
-            if (darkScene > 0.0)
-            {
-                // Image #3-style case: Lightroom's Highlights is not merely a
-                // local top-end recovery. In dark frames with a strong clipped
-                // highlight component it pulls the whole rendered tone scale,
-                // increasingly hard toward the upper half. Use a display-
-                // referred proxy for the mask because the exported calibration
-                // curves line up with rendered luma bins, not raw scene EV.
-                double yd = Math.Pow(LightroomMatch(DisplayCurve(y)), 2.19921875);
-                double darkStops =
-                    HighlightsV4DarkRecoverBase
-                    + HighlightsV4DarkRecoverLow  * SmoothStep(0.01, 0.12, yd)
-                    + HighlightsV4DarkRecoverHigh * SmoothStep(0.14, 0.55, yd)
-                    + HighlightsV4DarkRecoverTop  * SmoothStep(0.82, 0.98, yd);
-                deltaEv += s * darkScene * darkStops;
-            }
-        }
-        else
-        {
-            // Push: the broad envelope only, weaker, fully top-protected
-            // (positive Highlights must not drive near-white into clipping).
-            deltaEv = s * HighlightsV4PushStops * rise * protect;
-
-            if (darkScene > 0.0)
-            {
-                double yd = Math.Pow(LightroomMatch(DisplayCurve(y)), 2.19921875);
-                double roll = 1.0 - SmoothStep(HighlightsV4DarkPushRollLo, HighlightsV4DarkPushRollHi, yd);
-                double darkStops =
-                    (HighlightsV4DarkPushBase
-                     + HighlightsV4DarkPushMid * SmoothStep(0.015, 0.18, yd))
-                    * roll;
-                deltaEv += s * darkScene * darkStops;
-            }
-        }
-
-        if (deltaEv == 0.0) return;
-
-        double newY = LumaFromEv(ev + deltaEv);
-        double ratio = newY / y;
+        double y2 = MiddleGray * double.Exp2(WhitesKneeEv + SoftKnee(d, slope, WhitesWidthEv));
+        double ratio = y2 / y;
         r *= ratio; g *= ratio; b *= ratio;
-
-        // Chroma coupling, bounded by the EV move (recovery saturates, push
-        // desaturates) — a plain luminance ratio holds std/mean fixed, but LR
-        // measurably shifts saturation with the highlight move.
-        double sat = deltaEv < 0.0
-            ? 1.0 + HighlightsV4ChromaRecover * (-deltaEv)
-            : 1.0 - HighlightsV4ChromaPush * deltaEv;
-        if (sat > HighlightsV4MaxChroma) sat = HighlightsV4MaxChroma;
-        if (sat < 0.0) sat = 0.0;
-        if (sat != 1.0)
-        {
-            r = newY + (r - newY) * sat;
-            g = newY + (g - newY) * sat;
-            b = newY + (b - newY) * sat;
-        }
     }
 
-    /// <summary>True iff any H/S/W/B version can use the
-    /// <see cref="EdgeAwareLuma"/> regional pre-pass. Callers should still gate
-    /// this by nonzero slider values so neutral renders stay cheap.</summary>
-    public static bool NeedsEvBase(int highlightsVersion, int shadowsVersion, int whitesVersion, int blacksVersion)
-        => highlightsVersion == 3 || highlightsVersion == 4 || shadowsVersion == 3
-        || whitesVersion == 3 || blacksVersion == 3;
-
-    // ── Version dispatchers ──────────────────────────────────────────────
+    // ── A note on Exposure ────────────────────────────────────────────────
     //
-    // evBase (regional log-luminance, in EV from middle grey) is consulted by
-    // case 3 and by v4 Highlights' contextual recovery. v1/v2 ignore it.
+    // Exposure stays exactly what it was: a true 2^EV multiply via ExposureGain,
+    // with no shoulder or rolloff of its own. A highlight rolloff whose strength
+    // scaled with the exposure being applied was tried and removed — it made the
+    // slider non-monotonic. Because the compression grew faster than the extra
+    // stop, +2 EV clipped *less* of the frame than +1 EV (2.1% vs 15.7% on the
+    // reference scene) and very bright pixels came out darker as the slider went
+    // up. Any schedule strong enough to preserve a gradient across the clip was
+    // strong enough to invert the slider somewhere.
+    //
+    // The parity gap with Lightroom for Exposure was never the gain — it was that
+    // pulling exposure down could not recover blown highlights, because the decoder
+    // had already flattened them. HighlightReconstruction fixes that, and
+    // DevelopProcessor runs it whenever Exposure is negative. What is left is a
+    // physical stop, which is both what this codebase intended and what Lightroom's
+    // Exposure behaves like; the top-end rolloff belongs to the output transform.
 
-    public static void ApplyHighlights(int version, ref double r, ref double g, ref double b,
-                                       double highlights, double evBase,
-                                       double darkSceneBoost = 0.0)
-    {
-        switch (version)
-        {
-            case 4: ApplyHighlightsV4(ref r, ref g, ref b, highlights, evBase, darkSceneBoost); break;
-            case 3: ApplyHighlightsV3(ref r, ref g, ref b, highlights, evBase); break;
-            case 2: ApplyHighlightsV2(ref r, ref g, ref b, highlights); break;
-            default: ApplyHighlightsV1(ref r, ref g, ref b, highlights); break;
-        }
-    }
+    // ── Dispatchers ──────────────────────────────────────────────────────
+    //
+    // Highlights is no longer here: it is a spatial, edge-aware local-tone
+    // operator (see LocalHighlights) applied to whole RGB planes by
+    // DevelopProcessor, not a per-pixel EV curve.
 
-    public static void ApplyContrast(int version, ref double r, ref double g, ref double b,
-                                     double contrast, double contrastSlope)
-    {
-        switch (version)
-        {
-            case 2: ApplyContrastV2(ref r, ref g, ref b, contrast); break;
-            default: ApplyContrastV1(ref r, ref g, ref b, contrastSlope); break;
-        }
-    }
+    public static void ApplyContrast(ref double r, ref double g, ref double b,
+                                     double contrast)
+        => ApplyContrastV2(ref r, ref g, ref b, contrast);
 
-    public static void ApplyShadows(int version, ref double r, ref double g, ref double b,
+    public static void ApplyShadows(ref double r, ref double g, ref double b,
                                     double shadows, double evBase)
-    {
-        switch (version)
-        {
-            case 3: ApplyShadowsV3(ref r, ref g, ref b, shadows, evBase); break;
-            case 2: ApplyShadowsV2(ref r, ref g, ref b, shadows); break;
-            default: ApplyShadowsV1(ref r, ref g, ref b, shadows); break;
-        }
-    }
+        => ApplyShadowsV3(ref r, ref g, ref b, shadows, evBase);
 
-    public static void ApplyWhites(int version, ref double r, ref double g, ref double b,
-                                   double whites, double evBase)
-    {
-        switch (version)
-        {
-            case 3: ApplyWhitesV3(ref r, ref g, ref b, whites, evBase); break;
-            case 2: ApplyWhitesV2(ref r, ref g, ref b, whites); break;
-            default: ApplyWhitesV1(ref r, ref g, ref b, whites); break;
-        }
-    }
+    /// <summary>Whites takes no evBase: v4 is global (see the section note above).</summary>
+    public static void ApplyWhites(ref double r, ref double g, ref double b,
+                                   double whites)
+        => ApplyWhitesV4(ref r, ref g, ref b, whites);
 
-    public static void ApplyBlacks(int version, ref double r, ref double g, ref double b,
+    public static void ApplyBlacks(ref double r, ref double g, ref double b,
                                    double blacks, double evBase)
-    {
-        switch (version)
-        {
-            case 3: ApplyBlacksV3(ref r, ref g, ref b, blacks, evBase); break;
-            case 2: ApplyBlacksV2(ref r, ref g, ref b, blacks); break;
-            default: ApplyBlacksV1(ref r, ref g, ref b, blacks); break;
-        }
-    }
+        => ApplyBlacksV3(ref r, ref g, ref b, blacks, evBase);
 }

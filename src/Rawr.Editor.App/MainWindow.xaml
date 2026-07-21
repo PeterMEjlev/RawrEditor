@@ -4,18 +4,18 @@
         xmlns:vm="clr-namespace:Rawr.Editor.App.ViewModels"
         xmlns:ctl="clr-namespace:Rawr.Editor.App.Controls"
         Title="RAWR Editor — Develop"
-        Height="860" Width="1340"
+        Height="860" Width="1400"
         WindowStartupLocation="CenterScreen">
 
     <Window.DataContext>
         <vm:MainViewModel />
     </Window.DataContext>
 
-    <Window.InputBindings>
-        <!-- \ toggles Before/After like Lightroom. -->
-        <KeyBinding Key="OemPipe" Command="{Binding ToggleBeforeCommand}" />
-        <KeyBinding Key="OemBackslash" Command="{Binding ToggleBeforeCommand}" />
-    </Window.InputBindings>
+    <!-- Shortcuts are handled in code rather than through InputBindings so they
+         can stand down while the caret is in one of the panel's value boxes —
+         an InputBinding fires wherever focus happens to be, which would make
+         typing a number into a slider trip the tool it happens to spell. -->
+
 
     <Grid>
         <Grid.RowDefinitions>
@@ -120,7 +120,7 @@
         <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="340" />
+                <ColumnDefinition Width="400" />
             </Grid.ColumnDefinitions>
 
             <!-- Photo viewer. The Image is transformed via MatrixTransform so
@@ -144,12 +144,42 @@
                            RenderTransformOrigin="0.5,0.5"
                            IsHitTestVisible="False">
                         <Image.RenderTransform>
+                            <!-- Rotate first, about the same centre the scale
+                                 pivots on. It is only ever non-zero inside the
+                                 crop tool, where the straighten is applied here
+                                 rather than by the renderer so that turning the
+                                 photo costs nothing — see PreviewGeometry. -->
                             <TransformGroup>
+                                <RotateTransform x:Name="ViewerRotate" Angle="0" />
                                 <ScaleTransform x:Name="ViewerScale" ScaleX="1" ScaleY="1" />
                                 <TranslateTransform x:Name="ViewerTranslate" X="0" Y="0" />
                             </TransformGroup>
                         </Image.RenderTransform>
                     </Image>
+
+                    <!-- Mask overlay. Sits above the photo and below the status
+                         scrims, and mirrors the viewer transform rather than
+                         inheriting it so handles keep a constant screen size at
+                         any zoom. Presses it does not want are left unhandled
+                         and fall through to the pan handler on ViewerHost. -->
+                    <ctl:MaskOverlay x:Name="MaskOverlay"
+                                     Masks="{Binding MaskShapes, Mode=OneWay}"
+                                     SelectedMask="{Binding SelectedMaskShape, Mode=OneWay}"
+                                     IsActive="{Binding IsMaskingActive, Mode=OneWay}"
+                                     IsCreating="{Binding IsCreatingMask, Mode=OneWay}"
+                                     ShowTint="{Binding ShowMaskOverlay, Mode=OneWay}" />
+
+                    <!-- Crop box. Declared after the mask overlay so it sits on
+                         top of it — the two are never live at once, and while
+                         this one is inactive it paints nothing at all, which is
+                         what leaves the mask handles reachable underneath. -->
+                    <ctl:CropOverlay x:Name="CropOverlay"
+                                     Geometry="{Binding CropGeometry, Mode=OneWay}"
+                                     SourceWidth="{Binding CropSourceWidth, Mode=OneWay}"
+                                     SourceHeight="{Binding CropSourceHeight, Mode=OneWay}"
+                                     IsActive="{Binding IsCropActive, Mode=OneWay}"
+                                     Guide="{Binding CropGuide, Mode=OneWay}"
+                                     AspectRatio="{Binding CropAspectRatio, Mode=OneWay}" />
 
                     <TextBlock Text="Open a RAW photo to begin  (Open RAW…)"
                                Foreground="{StaticResource TextDimBrush}"
@@ -178,52 +208,424 @@
                     Background="{StaticResource BgPanelBrush}"
                     BorderBrush="{StaticResource BorderBrush}"
                     BorderThickness="1,0,0,0">
-                <ScrollViewer VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Disabled"
-                              Padding="14,16">
-                    <StackPanel>
+                <!-- Edit and Masks are separate tabs rather than stacked sections:
+                     they are different jobs (adjust the whole photo / adjust part
+                     of it), and keeping them apart is what lets the on-canvas
+                     ellipse and its handles appear only while you are actually
+                     working on masks — see IsMaskingActive. -->
+                <TabControl Style="{StaticResource PanelTabControl}"
+                            SelectedIndex="{Binding SelectedPanelTab, Mode=TwoWay}">
 
+                    <TabItem Header="EDIT" Style="{StaticResource PanelTabItem}">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled"
+                                      Padding="14,16">
+                            <StackPanel>
+
+                        <!-- Section order and grouping follow Lightroom: Light first,
+                             then Color — where Color owns the white balance pair and
+                             the presence pair, since both act on hue/saturation. -->
                         <Border Style="{StaticResource SectionCard}">
                             <StackPanel>
-                                <TextBlock Text="WHITE BALANCE" Style="{StaticResource SectionCardHeader}" />
-                                <ctl:AdjustmentRow Label="Temp"  Value="{Binding Temperature, Mode=TwoWay}" />
-                                <ctl:AdjustmentRow Label="Tint"  Value="{Binding Tint, Mode=TwoWay}" />
-                            </StackPanel>
-                        </Border>
-
-                        <Border Style="{StaticResource SectionCard}">
-                            <StackPanel>
-                                <TextBlock Text="TONE" Style="{StaticResource SectionCardHeader}" />
+                                <TextBlock Text="LIGHT" Style="{StaticResource SectionCardHeader}" />
+                                <!-- Exposure is the one slider that keeps decimals: it is a
+                                     physical quantity in stops, and Lightroom's 0.05 step is
+                                     finer than one integer stop by design. -->
                                 <ctl:AdjustmentRow Label="Exposure" Value="{Binding Exposure, Mode=TwoWay}"
-                                                   Minimum="-5" Maximum="5" Step="0.05" />
-                                <ctl:AdjustmentRow Label="Contrast"   Value="{Binding Contrast, Mode=TwoWay}"
-                                                   Version="{Binding ContrastVersion, Mode=TwoWay}"
-                                                   VersionCount="{Binding ContrastVersionCount, Mode=OneTime}" />
-                                <ctl:AdjustmentRow Label="Highlights" Value="{Binding Highlights, Mode=TwoWay}"
-                                                   Version="{Binding HighlightsVersion, Mode=TwoWay}"
-                                                   VersionCount="{Binding HighlightsVersionCount, Mode=OneTime}" />
-                                <ctl:AdjustmentRow Label="Shadows"    Value="{Binding Shadows, Mode=TwoWay}"
-                                                   Version="{Binding ShadowsVersion, Mode=TwoWay}"
-                                                   VersionCount="{Binding ShadowsVersionCount, Mode=OneTime}" />
-                                <ctl:AdjustmentRow Label="Whites"     Value="{Binding Whites, Mode=TwoWay}"
-                                                   Version="{Binding WhitesVersion, Mode=TwoWay}"
-                                                   VersionCount="{Binding WhitesVersionCount, Mode=OneTime}" />
-                                <ctl:AdjustmentRow Label="Blacks"     Value="{Binding Blacks, Mode=TwoWay}"
-                                                   Version="{Binding BlacksVersion, Mode=TwoWay}"
-                                                   VersionCount="{Binding BlacksVersionCount, Mode=OneTime}" />
+                                                   Minimum="-5" Maximum="5" Step="0.05" Decimals="2" />
+                                <ctl:AdjustmentRow Label="Contrast"   Value="{Binding Contrast, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Highlights" Value="{Binding Highlights, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Shadows"    Value="{Binding Shadows, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Whites"     Value="{Binding Whites, Mode=TwoWay}" />
+                                <ctl:AdjustmentRow Label="Blacks"     Value="{Binding Blacks, Mode=TwoWay}" />
                             </StackPanel>
                         </Border>
 
                         <Border Style="{StaticResource SectionCard}">
                             <StackPanel>
-                                <TextBlock Text="PRESENCE" Style="{StaticResource SectionCardHeader}" />
-                                <ctl:AdjustmentRow Label="Vibrance"   Value="{Binding Vibrance, Mode=TwoWay}" />
-                                <ctl:AdjustmentRow Label="Saturation" Value="{Binding Saturation, Mode=TwoWay}" />
+                                <TextBlock Text="COLOR" Style="{StaticResource SectionCardHeader}" />
+                                <!-- Temp carries a unit pill: "Δ" for a shift relative to the
+                                     camera white balance, "K" for an absolute illuminant. The
+                                     range, step and origin all follow the mode. -->
+                                <ctl:AdjustmentRow Label="Temp"
+                                                   Value="{Binding TemperatureSliderValue, Mode=TwoWay}"
+                                                   Minimum="{Binding TempMinimum, Mode=OneWay}"
+                                                   Maximum="{Binding TempMaximum, Mode=OneWay}"
+                                                   Step="{Binding TempStep, Mode=OneWay}"
+                                                   Scale="{Binding TempScale, Mode=OneWay}"
+                                                   Origin="{Binding TempOrigin, Mode=OneWay}"
+                                                   IsAlternateUnit="{Binding UseKelvin, Mode=TwoWay}"
+                                                   UnitText="Δ"
+                                                   AlternateUnitText="K"
+                                                   TrackBrush="{Binding TempTrackBrush, Mode=OneWay}" />
+                                <ctl:AdjustmentRow Label="Tint"  Value="{Binding Tint, Mode=TwoWay}"
+                                                   TrackBrush="{Binding TintTrackBrush, Mode=OneTime}" />
+                                <ctl:AdjustmentRow Label="Vibrance"   Value="{Binding Vibrance, Mode=TwoWay}"
+                                                   TrackBrush="{Binding PresenceTrackBrush, Mode=OneTime}" />
+                                <ctl:AdjustmentRow Label="Saturation" Value="{Binding Saturation, Mode=TwoWay}"
+                                                   TrackBrush="{Binding PresenceTrackBrush, Mode=OneTime}" />
                             </StackPanel>
                         </Border>
 
-                    </StackPanel>
-                </ScrollViewer>
+                        <!-- Eight hue bands, one shown at a time — Lightroom's
+                             "Adjust: Color" mode. The three rows are a view onto
+                             whichever band the swatch row has selected; the
+                             view-model routes them and repaints the tracks. -->
+                        <Border Style="{StaticResource SectionCard}">
+                            <StackPanel>
+                                <TextBlock Text="COLOR MIXER" Style="{StaticResource SectionCardHeader}" />
+
+                                <ListBox Style="{StaticResource ColorBandSelector}"
+                                         ItemsSource="{Binding ColorBands}"
+                                         SelectedValuePath="Band"
+                                         SelectedValue="{Binding SelectedColorBand, Mode=TwoWay}"
+                                         HorizontalAlignment="Center"
+                                         Margin="0,0,0,12" />
+
+                                <ctl:AdjustmentRow Label="Hue"
+                                                   Value="{Binding BandHue, Mode=TwoWay}"
+                                                   TrackBrush="{Binding BandHueTrackBrush, Mode=OneWay}" />
+                                <ctl:AdjustmentRow Label="Saturation"
+                                                   Value="{Binding BandSaturation, Mode=TwoWay}"
+                                                   TrackBrush="{Binding BandSaturationTrackBrush, Mode=OneWay}" />
+                                <ctl:AdjustmentRow Label="Luminance"
+                                                   Value="{Binding BandLuminance, Mode=TwoWay}"
+                                                   TrackBrush="{Binding BandLuminanceTrackBrush, Mode=OneWay}" />
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Effects. Texture and Clarity are the same base/detail
+                             operator at two scales, Dehaze inverts a haze model in
+                             scene-linear light, and Grain is a synthetic emulsion
+                             laid on at the very end. -->
+                        <Border Style="{StaticResource SectionCard}">
+                            <StackPanel>
+                                <TextBlock Text="EFFECTS" Style="{StaticResource SectionCardHeader}" />
+                                <ctl:AdjustmentRow Label="Texture" Value="{Binding Texture, Mode=TwoWay}"
+                                                   ToolTip="Fine detail — negative smooths skin, positive brings out pores and foliage" />
+                                <ctl:AdjustmentRow Label="Clarity" Value="{Binding Clarity, Mode=TwoWay}"
+                                                   ToolTip="Broad local contrast, weighted to the midtones so it cannot crush blacks or clip highlights" />
+                                <ctl:AdjustmentRow Label="Dehaze"  Value="{Binding Dehaze, Mode=TwoWay}"
+                                                   ToolTip="Removes (or adds) atmospheric haze" />
+
+                                <!-- Grain's supporting pair, like Sharpening's, are
+                                     inert while Amount is 0 but keep their own
+                                     defaults rather than sitting at zero. -->
+                                <ctl:AdjustmentRow Label="Grain" Value="{Binding GrainAmount, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="100" Origin="0" />
+                                <ctl:AdjustmentRow Label="Size" Value="{Binding GrainSize, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="100" Origin="25"
+                                                   ToolTip="Grain cell size. Scales with resolution, so the preview and the export match" />
+                                <ctl:AdjustmentRow Label="Roughness" Value="{Binding GrainRoughness, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="100" Origin="50"
+                                                   ToolTip="Mixes in a second, finer octave — higher is more irregular" />
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Detail. These rows are unipolar and several sit at a
+                             non-zero default, so each carries its own Minimum /
+                             Maximum / Origin — Origin being both the double-click
+                             reset target and where the accent fill grows from. -->
+                        <Border Style="{StaticResource SectionCard}">
+                            <StackPanel>
+                                <TextBlock Text="SHARPENING" Style="{StaticResource SectionCardHeader}" />
+                                <ctl:AdjustmentRow Label="Amount" Value="{Binding Sharpening, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="150" Origin="0"
+                                                   ToolTip="Judge sharpening at 100% — the fit view renders a smaller buffer" />
+                                <!-- The one Detail row with decimals: radius is a
+                                     physical distance in pixels, and 0.1 px steps
+                                     are what Lightroom gives it. -->
+                                <ctl:AdjustmentRow Label="Radius" Value="{Binding SharpenRadius, Mode=TwoWay}"
+                                                   Minimum="0.5" Maximum="3" Step="0.1" Decimals="1" Origin="1" />
+                                <ctl:AdjustmentRow Label="Detail" Value="{Binding SharpenDetail, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="100" Origin="25" />
+                                <ctl:AdjustmentRow Label="Masking" Value="{Binding SharpenMasking, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="100" Origin="0"
+                                                   IsDragging="{Binding IsDraggingMasking, Mode=TwoWay}" />
+                                <CheckBox Content="Show mask while dragging"
+                                          IsChecked="{Binding ShowSharpenMask, Mode=TwoWay}"
+                                          Foreground="{StaticResource TextDimBrush}"
+                                          Margin="0,6,0,0"
+                                          ToolTip="While you hold the Masking thumb, show the mask instead of the photo — white is sharpened, black is protected" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource SectionCard}">
+                            <StackPanel>
+                                <TextBlock Text="NOISE REDUCTION" Style="{StaticResource SectionCardHeader}" />
+                                <ctl:AdjustmentRow Label="Luminance" Value="{Binding LuminanceNoiseReduction, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="100" Origin="0" />
+                                <ctl:AdjustmentRow Label="Detail" Value="{Binding LuminanceNoiseDetail, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="100" Origin="50" />
+                                <ctl:AdjustmentRow Label="Contrast" Value="{Binding LuminanceNoiseContrast, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="100" Origin="0" />
+                                <ctl:AdjustmentRow Label="Color" Value="{Binding ColorNoiseReduction, Mode=TwoWay}"
+                                                   Minimum="0" Maximum="100" Origin="25"
+                                                   ToolTip="Chroma denoise. 25 is the strength this pipeline has always applied" />
+                            </StackPanel>
+                        </Border>
+
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+
+                    <!-- Crop. Unlike the other two tabs this one changes what the
+                         viewer shows: the whole straightened frame, so the box
+                         can be dragged outward over the parts being cut away.
+                         See MainViewModel.PreviewGeometry. -->
+                    <TabItem Header="CROP" Style="{StaticResource PanelTabItem}">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled"
+                                      Padding="14,16">
+                            <StackPanel IsEnabled="{Binding HasPhoto}">
+
+                                <Border Style="{StaticResource SectionCard}">
+                                    <StackPanel>
+                                        <TextBlock Text="CROP" Style="{StaticResource SectionCardHeader}" />
+
+                                        <Grid Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="Aspect"
+                                                       Foreground="{StaticResource TextDimBrush}"
+                                                       Margin="0,0,10,0" />
+                                            <!-- ItemTemplate, not DisplayMemberPath:
+                                                 the closed box renders through
+                                                 SelectionBoxItemTemplate, which
+                                                 WPF only fills in from a real
+                                                 ItemTemplate. With just the path
+                                                 set it falls back to ToString()
+                                                 and shows the type name. -->
+                                            <ComboBox Grid.Column="1"
+                                                      ItemsSource="{Binding CropAspects}"
+                                                      SelectedItem="{Binding SelectedCropAspect, Mode=TwoWay}"
+                                                      ToolTip="Locks the box to these proportions while you drag it. Custom leaves it free">
+                                                <ComboBox.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <TextBlock Text="{Binding Name}" />
+                                                    </DataTemplate>
+                                                </ComboBox.ItemTemplate>
+                                            </ComboBox>
+                                        </Grid>
+
+                                        <ctl:AdjustmentRow Label="Straighten"
+                                                           Value="{Binding Straighten, Mode=TwoWay}"
+                                                           Minimum="-45" Maximum="45"
+                                                           Step="0.1" Decimals="1"
+                                                           UnitText="°"
+                                                           ToolTip="Rotates the photo under the box. The crop pulls in as it turns so the corners never run off the frame" />
+
+                                        <Grid Margin="0,4,0,0">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="Overlay"
+                                                       Foreground="{StaticResource TextDimBrush}"
+                                                       Margin="0,0,10,0" />
+                                            <ComboBox Grid.Column="1"
+                                                      ItemsSource="{Binding CropGuides}"
+                                                      SelectedItem="{Binding CropGuide, Mode=TwoWay}"
+                                                      ToolTip="Guide grid drawn inside the box" />
+                                        </Grid>
+
+                                        <DockPanel Margin="0,12,0,0" LastChildFill="False">
+                                            <TextBlock DockPanel.Dock="Left"
+                                                       Text="{Binding CropRatioText}"
+                                                       Foreground="{StaticResource TextDimBrush}"
+                                                       ToolTip="Proportions of the current box" />
+                                            <Button DockPanel.Dock="Right"
+                                                    Content="Reset crop"
+                                                    Command="{Binding ResetCropCommand}"
+                                                    ToolTip="Back to the whole frame, keeping the rotation and flips" />
+                                        </DockPanel>
+                                    </StackPanel>
+                                </Border>
+
+                                <Border Style="{StaticResource SectionCard}">
+                                    <StackPanel>
+                                        <TextBlock Text="ROTATE &amp; FLIP" Style="{StaticResource SectionCardHeader}" />
+                                        <!-- Quarter turns and mirrors cost no
+                                             resampling — they are an index remap,
+                                             so unlike Straighten they can be
+                                             applied and undone for free. -->
+                                        <UniformGrid Rows="1" Columns="4">
+                                            <Button Content="↺" FontSize="16"
+                                                    Margin="0,0,4,0"
+                                                    Command="{Binding RotateLeftCommand}"
+                                                    ToolTip="Rotate 90° anticlockwise" />
+                                            <Button Content="↻" FontSize="16"
+                                                    Margin="0,0,4,0"
+                                                    Command="{Binding RotateRightCommand}"
+                                                    ToolTip="Rotate 90° clockwise" />
+                                            <Button Content="⇋" FontSize="16"
+                                                    Margin="0,0,4,0"
+                                                    Command="{Binding FlipHorizontalCommand}"
+                                                    ToolTip="Flip left to right" />
+                                            <Button Content="⇅" FontSize="16"
+                                                    Command="{Binding FlipVerticalCommand}"
+                                                    ToolTip="Flip top to bottom" />
+                                        </UniformGrid>
+                                    </StackPanel>
+                                </Border>
+
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+
+                    <TabItem Header="MASKS" Style="{StaticResource PanelTabItem}">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled"
+                                      Padding="14,16">
+                            <StackPanel>
+                                <Border Style="{StaticResource SectionCard}">
+                                    <StackPanel>
+
+                                        <Grid Margin="0,0,0,8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="6" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <Button Grid.Column="0"
+                                                    Content="＋  Radial"
+                                                    Command="{Binding BeginRadialMaskCommand}"
+                                                    IsEnabled="{Binding HasPhoto}"
+                                                    ToolTip="Then drag on the photo, from the centre outward" />
+                                            <Button Grid.Column="2"
+                                                    Content="＋  Linear"
+                                                    Command="{Binding BeginLinearMaskCommand}"
+                                                    IsEnabled="{Binding HasPhoto}"
+                                                    ToolTip="Then drag from the full-strength edge toward where the effect should fade out" />
+                                        </Grid>
+
+                                        <TextBlock Text="No masks yet — add one, then drag on the photo."
+                                                   Foreground="{StaticResource TextDimBrush}"
+                                                   TextWrapping="Wrap"
+                                                   Margin="0,0,0,4"
+                                                   Visibility="{Binding SelectedMask, Converter={StaticResource NullVis}}" />
+
+                                        <ListBox ItemsSource="{Binding Masks}"
+                                                 SelectedItem="{Binding SelectedMask, Mode=TwoWay}"
+                                                 BorderThickness="0"
+                                                 Background="Transparent"
+                                                 MaxHeight="150"
+                                                 HorizontalContentAlignment="Stretch"
+                                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                            <ListBox.ItemTemplate>
+                                                <DataTemplate>
+                                                    <DockPanel LastChildFill="True">
+                                                        <!-- Unchecking keeps the mask and its
+                                                             settings but takes it out of the
+                                                             render — the local A/B. -->
+                                                        <CheckBox DockPanel.Dock="Left"
+                                                                  IsChecked="{Binding IsEnabled, Mode=TwoWay}"
+                                                                  VerticalAlignment="Center"
+                                                                  Margin="0,0,6,0"
+                                                                  ToolTip="Include this mask in the render" />
+                                                        <Button DockPanel.Dock="Right"
+                                                                Content="✕"
+                                                                Width="20"
+                                                                Padding="0"
+                                                                Background="Transparent"
+                                                                BorderThickness="0"
+                                                                Foreground="{StaticResource TextDimBrush}"
+                                                                Command="{Binding DataContext.DeleteMaskCommand,
+                                                                    RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                                                CommandParameter="{Binding}"
+                                                                ToolTip="Delete this mask" />
+                                                        <TextBlock Text="{Binding Name}"
+                                                                   VerticalAlignment="Center"
+                                                                   TextTrimming="CharacterEllipsis" />
+                                                    </DockPanel>
+                                                </DataTemplate>
+                                            </ListBox.ItemTemplate>
+                                        </ListBox>
+
+                                        <!-- Everything below edits the selected mask. -->
+                                        <StackPanel Visibility="{Binding SelectedMask, Converter={StaticResource NotNullVis}}"
+                                                    Margin="0,8,0,0">
+
+                                            <CheckBox Content="Show mask overlay"
+                                                      IsChecked="{Binding ShowMaskOverlay, Mode=TwoWay}"
+                                                      Foreground="{StaticResource TextDimBrush}"
+                                                      Margin="0,0,0,8"
+                                                      ToolTip="Tint the selected mask red so you can see its falloff" />
+
+                                            <!-- Shape rows differ by kind: a radial has a
+                                                 feather inside a closed outline, a linear
+                                                 ramp's own length *is* its feather. Invert
+                                                 is common to both and routes in the item. -->
+                                            <ctl:AdjustmentRow Label="Feather"
+                                                               Value="{Binding SelectedMask.Feather, Mode=TwoWay}"
+                                                               Minimum="0" Maximum="100" Origin="0"
+                                                               Visibility="{Binding SelectedMask.IsRadial,
+                                                                   Converter={StaticResource BoolVis}}" />
+
+                                            <StackPanel Visibility="{Binding SelectedMask.IsLinear,
+                                                            Converter={StaticResource BoolVis}}">
+                                                <ctl:AdjustmentRow Label="Width"
+                                                                   Value="{Binding SelectedMask.Length, Mode=TwoWay}"
+                                                                   Minimum="0" Maximum="200" Origin="35"
+                                                                   ToolTip="How far the transition runs, as a percentage of the image width — the linear gradient's feather" />
+                                                <ctl:AdjustmentRow Label="Angle"
+                                                                   Value="{Binding SelectedMask.Angle, Mode=TwoWay}"
+                                                                   Minimum="-180" Maximum="180" Origin="90"
+                                                                   ToolTip="Direction the effect fades along. 90° fades downward" />
+                                            </StackPanel>
+
+                                            <CheckBox Content="Invert"
+                                                      IsChecked="{Binding SelectedMask.Invert, Mode=TwoWay}"
+                                                      Foreground="{StaticResource TextDimBrush}"
+                                                      Margin="0,2,0,10"
+                                                      ToolTip="Swap which side of the mask the effect applies to" />
+
+                                            <TextBlock Text="LIGHT" Style="{StaticResource SectionCardHeader}" />
+                                            <ctl:AdjustmentRow Label="Exposure"
+                                                               Value="{Binding SelectedMask.Exposure, Mode=TwoWay}"
+                                                               Minimum="-5" Maximum="5" Step="0.05" Decimals="2" />
+                                            <ctl:AdjustmentRow Label="Contrast"   Value="{Binding SelectedMask.Contrast, Mode=TwoWay}" />
+                                            <ctl:AdjustmentRow Label="Highlights" Value="{Binding SelectedMask.Highlights, Mode=TwoWay}" />
+                                            <ctl:AdjustmentRow Label="Shadows"    Value="{Binding SelectedMask.Shadows, Mode=TwoWay}" />
+                                            <ctl:AdjustmentRow Label="Whites"     Value="{Binding SelectedMask.Whites, Mode=TwoWay}" />
+                                            <ctl:AdjustmentRow Label="Blacks"     Value="{Binding SelectedMask.Blacks, Mode=TwoWay}" />
+
+                                            <TextBlock Text="COLOR" Style="{StaticResource SectionCardHeader}" Margin="0,8,0,0" />
+                                            <!-- No Kelvin pill here: a mask's Temp is a
+                                                 *shift* from whatever the global slider
+                                                 resolved to, so there is no absolute
+                                                 illuminant for it to display. -->
+                                            <ctl:AdjustmentRow Label="Temp"
+                                                               Value="{Binding SelectedMask.Temperature, Mode=TwoWay}"
+                                                               UnitText="Δ"
+                                                               TrackBrush="{Binding TempTrackBrush, Mode=OneWay}" />
+                                            <ctl:AdjustmentRow Label="Tint"
+                                                               Value="{Binding SelectedMask.Tint, Mode=TwoWay}"
+                                                               TrackBrush="{Binding TintTrackBrush, Mode=OneTime}" />
+                                            <ctl:AdjustmentRow Label="Vibrance"
+                                                               Value="{Binding SelectedMask.Vibrance, Mode=TwoWay}"
+                                                               TrackBrush="{Binding PresenceTrackBrush, Mode=OneTime}" />
+                                            <ctl:AdjustmentRow Label="Saturation"
+                                                               Value="{Binding SelectedMask.Saturation, Mode=TwoWay}"
+                                                               TrackBrush="{Binding PresenceTrackBrush, Mode=OneTime}" />
+
+                                            <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                                                <Button Content="Duplicate"
+                                                        Command="{Binding DuplicateMaskCommand}"
+                                                        Margin="0,0,6,0" />
+                                                <Button Content="Reset sliders"
+                                                        Command="{Binding ResetMaskCommand}"
+                                                        ToolTip="Zero this mask's adjustments but keep its shape" />
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Border>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+                </TabControl>
             </Border>
         </Grid>
 

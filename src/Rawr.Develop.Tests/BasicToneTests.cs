@@ -212,18 +212,17 @@ public class BasicToneTests
         }
     }
 
-    // ── 9. V3 (edge-aware) at 0 is identity regardless of evBase ───────────
+    // ── 9. Edge-aware sliders at 0 are identity regardless of evBase ────────
     [Theory]
     [InlineData(-3.0)]
     [InlineData(0.0)]
     [InlineData(3.0)]
-    public void V3_AtZero_IsIdentity(double evBase)
+    public void EdgeAware_AtZero_IsIdentity(double evBase)
     {
         double r = 0.42, g = 0.30, b = 0.66;
-        BasicTone.ApplyHighlightsV3(ref r, ref g, ref b, 0.0, evBase);
-        BasicTone.ApplyShadowsV3   (ref r, ref g, ref b, 0.0, evBase);
-        BasicTone.ApplyWhitesV3    (ref r, ref g, ref b, 0.0, evBase);
-        BasicTone.ApplyBlacksV3    (ref r, ref g, ref b, 0.0, evBase);
+        BasicTone.ApplyShadows   (ref r, ref g, ref b, 0.0, evBase);
+        BasicTone.ApplyWhites    (ref r, ref g, ref b, 0.0);   // v4 is global
+        BasicTone.ApplyBlacks    (ref r, ref g, ref b, 0.0, evBase);
 
         Assert.Equal(0.42, r, 12);
         Assert.Equal(0.30, g, 12);
@@ -231,25 +230,6 @@ public class BasicToneTests
     }
 
     // ── 10. V3 sliders gate on evBase, NOT on the per-pixel luminance ──────
-    // This is the whole point of the edge-aware path: a mid-grey pixel inside
-    // a bright region must behave as "highlight", and inside a dark region
-    // must behave as "shadow". The pixel's own value carries no information
-    // about which slider applies.
-    [Fact]
-    public void V3_Highlights_GateOnRegionalBrightness()
-    {
-        // mid-grey pixel inside a bright region (evBase = +3) ⇒ Highlights act
-        double r = BasicTone.MiddleGray, g = BasicTone.MiddleGray, b = BasicTone.MiddleGray;
-        BasicTone.ApplyHighlightsV3(ref r, ref g, ref b, -100.0, evBase: 3.0);
-        Assert.True(r < BasicTone.MiddleGray * 0.9,
-            $"expected strong highlight pull, got {r:F3}");
-
-        // mid-grey pixel inside a dark region (evBase = -3) ⇒ Highlights silent
-        double r2 = BasicTone.MiddleGray, g2 = BasicTone.MiddleGray, b2 = BasicTone.MiddleGray;
-        BasicTone.ApplyHighlightsV3(ref r2, ref g2, ref b2, -100.0, evBase: -3.0);
-        Assert.Equal(BasicTone.MiddleGray, r2, 9);
-    }
-
     [Fact]
     public void V3_Shadows_GateOnRegionalDarkness()
     {
@@ -289,196 +269,13 @@ public class BasicToneTests
         Assert.Equal(0.05, r2, 9);
     }
 
-    // ── 10b. V4 highlights: the Lightroom-calibrated bump shape ────────────
-
-    private static (double r, double g, double b) Hl4(
-        double v, double hl, double cb = 0.0, double darkSceneBoost = 0.0)
-    {
-        // grey ± a small blue/red split so chroma behaviour is observable.
-        double r = v + cb, g = v, b = v - cb;
-        BasicTone.ApplyHighlightsV4(ref r, ref g, ref b, hl, evBase: 0.0,
-            darkSceneBoost: darkSceneBoost);
-        return (r, g, b);
-    }
-
-    private static double EvDrop(double v, double hl)
-    {
-        var c = Hl4(v, hl);
-        double y0 = BasicTone.Luminance(v, v, v);
-        double y1 = BasicTone.Luminance(c.r, c.g, c.b);
-        return System.Math.Log2(y0 / y1);   // >0 ⇒ darkened
-    }
-
+    // ── 12. Dispatchers agree with the underlying VN implementations ──────────
     [Fact]
-    public void V4_AtZero_IsIdentity()
+    public void Dispatchers_MatchDirectVNCalls()
     {
-        var (r, g, b) = Hl4(0.42, 0.0, cb: 0.05);
-        Assert.Equal(0.47, r, 12);
-        Assert.Equal(0.42, g, 12);
-        Assert.Equal(0.37, b, 12);
-    }
-
-    [Fact]
-    public void V4_RegionalRecovery_StrengthensNegativeHighlightsOnly()
-    {
-        // The broad v4 curve is still per-pixel, but a high regional evBase
-        // adds LR-like recovery for pixels sitting inside clipped highlight
-        // regions. Positive Highlights stays top-protected and context-free.
-        double r1 = 0.6, g1 = 0.6, b1 = 0.6;
-        double r2 = 0.6, g2 = 0.6, b2 = 0.6;
-        BasicTone.ApplyHighlightsV4(ref r1, ref g1, ref b1, -100, evBase: -5.0);
-        BasicTone.ApplyHighlightsV4(ref r2, ref g2, ref b2, -100, evBase: +5.0);
-        Assert.True(r1 < 0.6, $"lights pixel should be pulled, got {r1:F4}");
-        Assert.True(r2 < r1 * 0.75,
-            $"high highlight context should add recovery, low-context {r1:F4}, high-context {r2:F4}");
-
-        double p1 = 0.6, p2 = 0.6, p3 = 0.6;
-        double q1 = 0.6, q2 = 0.6, q3 = 0.6;
-        BasicTone.ApplyHighlightsV4(ref p1, ref p2, ref p3, +100, evBase: -5.0);
-        BasicTone.ApplyHighlightsV4(ref q1, ref q2, ref q3, +100, evBase: +5.0);
-        Assert.Equal(p1, q1, 12);
-    }
-
-    [Fact]
-    public void V4_DarkSceneBoost_MakesHighlightsGlobalAndAsymmetric()
-    {
-        double normalDark = EvDrop(0.01, -100);
-        var boosted = Hl4(0.01, -100, darkSceneBoost: 1.0);
-        double boostedDark = System.Math.Log2(
-            BasicTone.Luminance(0.01, 0.01, 0.01) /
-            BasicTone.Luminance(boosted.r, boosted.g, boosted.b));
-        Assert.True(boostedDark > normalDark + 0.35,
-            $"dark-scene Highlights - should move even near-black, normal {normalDark:F3}, boosted {boostedDark:F3}");
-
-        var posTop = Hl4(1.0, +100, darkSceneBoost: 1.0);
-        Assert.True(posTop.r < 1.01,
-            $"dark-scene positive Highlights should stay protected near the top, got {posTop.r:F3}");
-
-        var posMid = Hl4(0.12, +100, darkSceneBoost: 1.0);
-        Assert.True(posMid.r > 0.12 * 1.5,
-            $"dark-scene Highlights + should lift lower mids, got {posMid.r:F3}");
-    }
-
-    [Fact]
-    public void V4_BroadReach_PeakInLights_ProtectsNearWhite()
-    {
-        // The decisive set-2 finding: pull reaches into the shadows, peaks in
-        // the lights, and collapses to ~0 at non-clipped near-white. v1/v2/v3
-        // would leave the shadow pixel completely untouched.
-        double shadow    = EvDrop(0.05, -100);   // y≈0.05  (deep shadow)
-        double lights    = EvDrop(0.60, -100);   // y≈0.60  (lights — the peak)
-        double nearWhite = EvDrop(0.99, -100);   // y≈0.99  (near-white, unclipped)
-
-        Assert.True(shadow > 0.15,
-            $"shadows must get the broad pull, got {shadow:F3} EV");
-        Assert.True(lights > 0.30,
-            $"lights is the peak, got {lights:F3} EV");
-        Assert.True(nearWhite < 0.10,
-            $"non-clipped near-white must be protected, got {nearWhite:F3} EV");
-        Assert.True(lights > nearWhite * 3.0,
-            $"peak {lights:F3} must dwarf protected top {nearWhite:F3}");
-    }
-
-    [Fact]
-    public void V4_LinearInSlider()
-    {
-        // −50 ≈ ½·−100 (the battery showed a clean linear response).
-        double half = EvDrop(0.60, -50);
-        double full = EvDrop(0.60, -100);
-        Assert.Equal(0.5, half / full, 2);
-    }
-
-    [Fact]
-    public void V4_RecoveryDominatesPush_Asymmetric()
-    {
-        // Clean lights pixel: negative clearly stronger than positive
-        // (~1.7× measured on set 2 — not symmetric like v1/v2/v3).
-        double y0 = 0.60;
-        double pull = EvDrop(0.60, -100);
-        var pos = Hl4(0.60, +100);
-        double push = System.Math.Log2(BasicTone.Luminance(pos.r, pos.g, pos.b) / y0);
-
-        Assert.True(pull > 0 && push > 0, $"pull {pull:F3}, push {push:F3}");
-        Assert.True(pull > push * 1.3,
-            $"recovery must exceed push, pull {pull:F3} vs push {push:F3}");
-
-        // Near-clipped pixel: positive is fully top-protected (no-op) while
-        // recovery still acts ⇒ the asymmetry widens to effectively infinite.
-        var posClip = Hl4(1.20, +100);
-        Assert.Equal(1.20, posClip.r, 9);
-        Assert.True(Hl4(1.20, -100).r < 1.20,
-            "recovery must still pull a clipped pixel");
-    }
-
-    [Fact]
-    public void V4_ScaleScalesWithClipping()
-    {
-        // Same slider: a genuinely blown pixel is pulled far harder in EV
-        // than a gently-exposed one — the scene-adaptive recovery boost.
-        double mild  = EvDrop(0.45, -100);   // just above middle grey
-        double blown = EvDrop(3.00, -100);   // deep into clipping
-        Assert.True(blown > mild * 2.0,
-            $"blown {blown:F3} EV must dwarf mild {mild:F3} EV");
-    }
-
-    [Fact]
-    public void V4_Recovery_RestoresChroma()
-    {
-        // A plain luminance ratio holds chroma/mean fixed; recovering a blown
-        // pixel must raise it (the colour LR's recovery brings back).
-        var (r, g, b) = Hl4(2.5, -100, cb: 0.15);
-
-        double mean = (r + g + b) / 3.0;
-        double baseRatio = 0.15 / 2.5;                       // (r−b)/2 over mean, before
-        double newRatio = (r - b) / (2.0 * System.Math.Max(mean, 1e-9));
-        Assert.True(newRatio > baseRatio,
-            $"expected chroma boost, before {baseRatio:F4} after {newRatio:F4}");
-    }
-
-    [Fact]
-    public void V4_Push_DesaturatesSlightly()
-    {
-        // Positive Highlights nudges saturation down (LR shows −chroma on +).
-        var (r, g, b) = Hl4(0.6, +100, cb: 0.10);
-        double mean = (r + g + b) / 3.0;
-        double newRatio = (r - b) / (2.0 * System.Math.Max(mean, 1e-9));
-        Assert.True(newRatio < 0.10 / 0.6,
-            $"expected slight desaturation, before {0.10 / 0.6:F4} after {newRatio:F4}");
-    }
-
-    [Fact]
-    public void V4_DispatcherRoutesCase4()
-    {
-        double r1 = 0.80, g1 = 0.80, b1 = 0.80;
-        double r2 = 0.80, g2 = 0.80, b2 = 0.80;
-        BasicTone.ApplyHighlights(4, ref r1, ref g1, ref b1, -70.0, 2.5);
-        BasicTone.ApplyHighlightsV4(ref r2, ref g2, ref b2, -70.0, 2.5);
-        Assert.Equal(r2, r1, 12);
-        Assert.Equal(g2, g1, 12);
-        Assert.Equal(b2, b1, 12);
-    }
-
-    // ── 11. NeedsEvBase detects regional/contextual versions ───────────────
-    [Fact]
-    public void NeedsEvBase_WhenAnyVersionUsesRegionalLuma()
-    {
-        Assert.False(BasicTone.NeedsEvBase(1, 1, 1, 1));
-        Assert.False(BasicTone.NeedsEvBase(2, 2, 2, 2));
-        Assert.True (BasicTone.NeedsEvBase(4, 1, 1, 1));   // v4 Highlights contextual recovery
-        Assert.True (BasicTone.NeedsEvBase(3, 1, 1, 1));
-        Assert.True (BasicTone.NeedsEvBase(1, 3, 1, 1));
-        Assert.True (BasicTone.NeedsEvBase(1, 1, 3, 1));
-        Assert.True (BasicTone.NeedsEvBase(1, 1, 1, 3));
-    }
-
-    // ── 12. Dispatcher routes case 3 to the edge-aware implementation ──────
-    [Fact]
-    public void Dispatchers_RouteV3ToEdgeAware()
-    {
-        // Compare dispatcher output to direct V3 call — they must agree.
         double r1 = 0.40, g1 = 0.40, b1 = 0.40;
         double r2 = 0.40, g2 = 0.40, b2 = 0.40;
-        BasicTone.ApplyShadows(3, ref r1, ref g1, ref b1, 80.0, -2.5);
+        BasicTone.ApplyShadows(ref r1, ref g1, ref b1, 80.0, -2.5);
         BasicTone.ApplyShadowsV3(ref r2, ref g2, ref b2, 80.0, -2.5);
         Assert.Equal(r2, r1, 12);
     }
