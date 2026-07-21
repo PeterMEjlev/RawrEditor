@@ -85,8 +85,10 @@ public sealed class MaskOverlay : FrameworkElement
     {
         None,
         Move,
-        // Radial
+        // Radial and rectangle
         Left, Right, Top, Bottom, Rotate,
+        // Rectangle corners — resize both axes at once.
+        TopLeft, TopRight, BottomLeft, BottomRight,
         // Linear: the full-effect line, the zero-effect line, and its rotator.
         LinearFull, LinearZero, LinearRotate,
     }
@@ -227,6 +229,14 @@ public sealed class MaskOverlay : FrameworkElement
          Math.Max(m.RadiusX, RadialMask.MinRadius) * ImageWidth,
          Math.Max(m.RadiusY, RadialMask.MinRadius) * ImageWidth);
 
+    /// <summary>Rectangle geometry in image pixels. Both half-extents are
+    /// normalised to <i>width</i> (see <see cref="RectangleMask"/>), so the screen
+    /// projection stays a plain uniform scale with no aspect correction.</summary>
+    private (double cx, double cy, double hw, double hh) PixelGeometry(RectangleMask m) =>
+        (m.CenterX * ImageWidth, m.CenterY * ImageHeight,
+         Math.Max(m.HalfWidth, RectangleMask.MinExtent) * ImageWidth,
+         Math.Max(m.HalfHeight, RectangleMask.MinExtent) * ImageWidth);
+
     /// <summary>Linear geometry in image pixels: centre, unit fade direction and
     /// half the full-to-zero distance.</summary>
     private (double cx, double cy, double dx, double dy, double half) PixelGeometry(LinearGradientMask m)
@@ -261,12 +271,14 @@ public sealed class MaskOverlay : FrameworkElement
         {
             if (!mask.IsEnabled || ReferenceEquals(mask, selected)) continue;
             if (mask.IsLinear) DrawLinear(dc, mask.Linear, selectedShape: false);
+            else if (mask.IsRectangle) DrawRectangleOutline(dc, mask.Rectangle, UnselectedPen, null);
             else DrawRadialOutline(dc, mask.Radial, UnselectedPen, null);
         }
 
         if (selected is not null && selected.IsEnabled)
         {
             if (selected.IsLinear) DrawLinear(dc, selected.Linear, selectedShape: true);
+            else if (selected.IsRectangle) DrawRectangleSelected(dc, selected.Rectangle);
             else DrawRadialSelected(dc, selected.Radial);
         }
     }
@@ -313,6 +325,64 @@ public sealed class MaskOverlay : FrameworkElement
                  {
                      new Point(-sx, 0), new Point(sx, 0),
                      new Point(0, -sy), new Point(0, sy),
+                 })
+            dc.DrawEllipse(HandleFill, HandleStroke, p, HandleRadius, HandleRadius);
+
+        dc.DrawEllipse(CenterFill, HandleStroke, new Point(0, 0), HandleRadius, HandleRadius);
+
+        dc.Pop();
+        dc.Pop();
+    }
+
+    private void DrawRectangleOutline(DrawingContext dc, RectangleMask m, Pen pen, Pen? shadow)
+    {
+        var (cx, cy, hw, hh) = PixelGeometry(m);
+        var center = ImageToScreen(cx, cy);
+        double s = ViewScale;
+        var box = new Rect(-hw * s, -hh * s, hw * s * 2, hh * s * 2);
+
+        dc.PushTransform(new TranslateTransform(center.X, center.Y));
+        dc.PushTransform(new RotateTransform(m.Rotation));
+        if (shadow is not null) dc.DrawRectangle(null, shadow, box);
+        dc.DrawRectangle(null, pen, box);
+        dc.Pop();
+        dc.Pop();
+    }
+
+    private void DrawRectangleSelected(DrawingContext dc, RectangleMask m)
+    {
+        var (cx, cy, hw, hh) = PixelGeometry(m);
+        var center = ImageToScreen(cx, cy);
+        double s = ViewScale;
+        double sx = hw * s, sy = hh * s;
+        var box = new Rect(-sx, -sy, sx * 2, sy * 2);
+
+        dc.PushTransform(new TranslateTransform(center.X, center.Y));
+        dc.PushTransform(new RotateTransform(m.Rotation));
+
+        dc.DrawRectangle(null, OutlineShadowPen, box);
+        dc.DrawRectangle(null, OutlinePen, box);
+
+        // The inner rectangle is where the falloff begins — the boundary of the
+        // fully-applied core, the rectangle's equivalent of the radial's inner
+        // ring, and invisible otherwise until the tint is switched on.
+        double inner = 1.0 - Math.Clamp(m.Feather, 0.0, 100.0) / 100.0;
+        if (inner > 0.02)
+            dc.DrawRectangle(null, FeatherPen, new Rect(-sx * inner, -sy * inner, sx * inner * 2, sy * inner * 2));
+
+        var stalkEnd = new Point(0, -(sy + RotationHandleGap));
+        dc.DrawLine(OutlineShadowPen, new Point(0, -sy), stalkEnd);
+        dc.DrawLine(OutlinePen, new Point(0, -sy), stalkEnd);
+        dc.DrawEllipse(HandleFill, HandleStroke, stalkEnd, HandleRadius, HandleRadius);
+
+        // Resize handles: the four edge midpoints (one axis each, as the radial
+        // has) plus the four corners, which drag both axes at once.
+        foreach (var p in new[]
+                 {
+                     new Point(-sx, 0), new Point(sx, 0),
+                     new Point(0, -sy), new Point(0, sy),
+                     new Point(-sx, -sy), new Point(sx, -sy),
+                     new Point(-sx, sy), new Point(sx, sy),
                  })
             dc.DrawEllipse(HandleFill, HandleStroke, p, HandleRadius, HandleRadius);
 
@@ -387,9 +457,11 @@ public sealed class MaskOverlay : FrameworkElement
     {
         var r = mask.Radial;
         var l = mask.Linear;
+        var q = mask.Rectangle;
         string key = string.Create(System.Globalization.CultureInfo.InvariantCulture,
             $"{mask.Kind}|{r.CenterX:F5},{r.CenterY:F5},{r.RadiusX:F5},{r.RadiusY:F5},{r.Rotation:F3},{r.Feather:F2},{r.Invert}|" +
-            $"{l.CenterX:F5},{l.CenterY:F5},{l.Angle:F3},{l.Length:F5},{l.Invert}|{ImageWidth}x{ImageHeight}");
+            $"{l.CenterX:F5},{l.CenterY:F5},{l.Angle:F3},{l.Length:F5},{l.Invert}|" +
+            $"{q.CenterX:F5},{q.CenterY:F5},{q.HalfWidth:F5},{q.HalfHeight:F5},{q.Rotation:F3},{q.Feather:F2},{q.Invert}|{ImageWidth}x{ImageHeight}");
         if (_tint is not null && ReferenceEquals(_tintFor, mask) && _tintKey == key) return _tint;
 
         int w = Math.Min(TintWidth, Math.Max(1, ImageWidth));
@@ -425,9 +497,12 @@ public sealed class MaskOverlay : FrameworkElement
     // ── Hit testing ────────────────────────────────────────────────────────
 
     private Grip HitTest(MaskSettings mask, Point screen, bool includeHandles)
-        => mask.IsLinear
-            ? HitTestLinear(mask.Linear, screen, includeHandles)
-            : HitTestRadial(mask.Radial, screen, includeHandles);
+        => mask.Kind switch
+        {
+            MaskKind.Linear => HitTestLinear(mask.Linear, screen, includeHandles),
+            MaskKind.Rectangle => HitTestRectangle(mask.Rectangle, screen, includeHandles),
+            _ => HitTestRadial(mask.Radial, screen, includeHandles),
+        };
 
     /// <summary>
     /// Which grip a screen point lands on for a radial. Handles are tested before
@@ -455,6 +530,43 @@ public sealed class MaskOverlay : FrameworkElement
         if (sx <= 0 || sy <= 0) return Grip.None;
         double u = d.X / sx, v = d.Y / sy;
         return u * u + v * v <= 1.0 ? Grip.Move : Grip.None;
+
+        static bool Near(Point p, double x, double y)
+            => Math.Abs(p.X - x) <= HandleHitSlop && Math.Abs(p.Y - y) <= HandleHitSlop;
+    }
+
+    /// <summary>
+    /// Which grip a screen point lands on for a rectangle. Mirrors the radial: the
+    /// edge-midpoint resize handles and the rotate stalk are tested first, then the
+    /// interior claims the move — but the interior test is the rectangle's own, a
+    /// pair of half-extent bounds rather than the ellipse's radial distance.
+    /// </summary>
+    private Grip HitTestRectangle(RectangleMask m, Point screen, bool includeHandles)
+    {
+        var (cx, cy, hw, hh) = PixelGeometry(m);
+        double s = ViewScale;
+        var center = ImageToScreen(cx, cy);
+        double sx = hw * s, sy = hh * s;
+
+        var d = ToLocal(screen.X - center.X, screen.Y - center.Y, m.Rotation);
+
+        if (includeHandles)
+        {
+            if (Near(d, 0, -(sy + RotationHandleGap))) return Grip.Rotate;
+            // Corners first: they sit where two edges meet, so testing them ahead
+            // of the midpoints keeps them from being swallowed by an edge grip.
+            if (Near(d, -sx, -sy)) return Grip.TopLeft;
+            if (Near(d, sx, -sy)) return Grip.TopRight;
+            if (Near(d, -sx, sy)) return Grip.BottomLeft;
+            if (Near(d, sx, sy)) return Grip.BottomRight;
+            if (Near(d, -sx, 0)) return Grip.Left;
+            if (Near(d, sx, 0)) return Grip.Right;
+            if (Near(d, 0, -sy)) return Grip.Top;
+            if (Near(d, 0, sy)) return Grip.Bottom;
+        }
+
+        if (sx <= 0 || sy <= 0) return Grip.None;
+        return Math.Abs(d.X) <= sx && Math.Abs(d.Y) <= sy ? Grip.Move : Grip.None;
 
         static bool Near(Point p, double x, double y)
             => Math.Abs(p.X - x) <= HandleHitSlop && Math.Abs(p.Y - y) <= HandleHitSlop;
@@ -584,6 +696,15 @@ public sealed class MaskOverlay : FrameworkElement
                 _ => centreD,
             };
         }
+        else if (mask.IsRectangle)
+        {
+            var m = mask.Rectangle;
+            _dragStartCx = m.CenterX;
+            _dragStartCy = m.CenterY;
+            _dragStartRx = m.HalfWidth;
+            _dragStartRy = m.HalfHeight;
+            _dragStartRotation = m.Rotation;
+        }
         else
         {
             var m = mask.Radial;
@@ -612,6 +733,7 @@ public sealed class MaskOverlay : FrameworkElement
 
         var image = ScreenToImage(screen);
         if (_dragMask.IsLinear) DragLinear(_dragMask.Linear, image);
+        else if (_dragMask.IsRectangle) DragRectangle(_dragMask.Rectangle, image);
         else DragRadial(_dragMask.Radial, image);
 
         InvalidateVisual();
@@ -672,6 +794,76 @@ public sealed class MaskOverlay : FrameworkElement
                 double cyPx = m.CenterY * ImageHeight;
                 // The handle sits on the mask's −Y axis, which is 90° behind the
                 // +X axis the angle is measured from.
+                double angle = Math.Atan2(image.Y - cyPx, image.X - cxPx) * 180.0 / Math.PI + 90.0;
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+                    angle = Math.Round(angle / 15.0) * 15.0;
+                m.Rotation = angle;
+                break;
+            }
+        }
+    }
+
+    private void DragRectangle(RectangleMask m, Point image)
+    {
+        switch (_grip)
+        {
+            case Grip.Move:
+                m.CenterX = Math.Clamp(_dragStartCx + (image.X - _dragStartImage.X) / ImageWidth, -0.5, 1.5);
+                m.CenterY = Math.Clamp(_dragStartCy + (image.Y - _dragStartImage.Y) / ImageHeight, -0.5, 1.5);
+                break;
+
+            case Grip.Left:
+            case Grip.Right:
+            case Grip.Top:
+            case Grip.Bottom:
+            case Grip.TopLeft:
+            case Grip.TopRight:
+            case Grip.BottomLeft:
+            case Grip.BottomRight:
+            {
+                // Resize is measured from the centre along the dragged axis, in the
+                // rectangle's own frame, so a rotated rectangle resizes along its
+                // own axes rather than the screen's — exactly the radial's logic
+                // with half-extents in place of radii.
+                double cxPx = m.CenterX * ImageWidth;
+                double cyPx = m.CenterY * ImageHeight;
+                var local = ToLocal(image.X - cxPx, image.Y - cyPx, m.Rotation);
+                double minExtent = MinRadiusPx / Math.Max(ViewScale, 1e-6);
+
+                // A corner (and the create drag) moves both axes; an edge midpoint
+                // moves only its own.
+                bool bothAxes = _creatingDrag ||
+                    _grip is Grip.TopLeft or Grip.TopRight or Grip.BottomLeft or Grip.BottomRight;
+
+                if (bothAxes)
+                {
+                    double hw = Math.Max(Math.Abs(local.X), minExtent);
+                    double hh = Math.Max(Math.Abs(local.Y), minExtent);
+                    if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+                    {
+                        double r = Math.Max(hw, hh);
+                        hw = hh = r;
+                    }
+                    m.HalfWidth = hw / ImageWidth;
+                    m.HalfHeight = hh / ImageWidth;
+                }
+                else if (_grip is Grip.Left or Grip.Right)
+                {
+                    m.HalfWidth = Math.Max(Math.Abs(local.X), minExtent) / ImageWidth;
+                }
+                else
+                {
+                    m.HalfHeight = Math.Max(Math.Abs(local.Y), minExtent) / ImageWidth;
+                }
+                break;
+            }
+
+            case Grip.Rotate:
+            {
+                double cxPx = m.CenterX * ImageWidth;
+                double cyPx = m.CenterY * ImageHeight;
+                // The handle sits on the rectangle's −Y axis, 90° behind the +X
+                // axis the angle is measured from.
                 double angle = Math.Atan2(image.Y - cyPx, image.X - cxPx) * 180.0 / Math.PI + 90.0;
                 if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
                     angle = Math.Round(angle / 15.0) * 15.0;
@@ -781,6 +973,8 @@ public sealed class MaskOverlay : FrameworkElement
             Grip.Rotate or Grip.LinearRotate => Cursors.Hand,
             Grip.Left or Grip.Right => Cursors.SizeWE,
             Grip.Top or Grip.Bottom => Cursors.SizeNS,
+            Grip.TopLeft or Grip.BottomRight => Cursors.SizeNWSE,
+            Grip.TopRight or Grip.BottomLeft => Cursors.SizeNESW,
             Grip.LinearFull or Grip.LinearZero => Cursors.SizeNS,
             Grip.Move => Cursors.SizeAll,
             _ => IsCreating ? Cursors.Cross : Cursors.Arrow,

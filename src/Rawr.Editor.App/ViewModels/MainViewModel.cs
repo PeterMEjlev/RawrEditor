@@ -21,17 +21,22 @@ namespace Rawr.Editor.App.ViewModels;
 
 /// <summary>
 /// Drives the single-photo develop screen. One RAW is decoded once at half-size
-/// and box-averaged down to <see cref="PreviewWidth"/>; every slider move then
-/// re-renders only that small buffer, debounced and cancellable, so editing
-/// stays smooth on big sensors. Export re-decodes at full resolution.
+/// and box-averaged down to a viewport-sized preview buffer; every slider move
+/// then re-renders only that small buffer, debounced and cancellable, so editing
+/// stays smooth on big sensors. Zooming to 100% overlays a full-resolution tile
+/// for the visible window, and export re-decodes at full resolution.
 /// </summary>
 public sealed partial class MainViewModel : ObservableObject
 {
-    // Preview working resolution. Sharp fit-to-screen on a 4K panel, yet small
-    // enough that a full pipeline pass is ~70 ms so dragging a slider stays
-    // fluid (measured: 45 MP CR3 → ~130 ms at 2560 px, ~70 ms here). Export is
-    // unaffected — it always re-decodes at full sensor resolution.
-    private const int PreviewWidth = 1920;
+    // Preview working resolution, as the buffer's long edge. Sized to the
+    // viewport (see SetPreviewLongEdge) so the Fit view isn't upscaled on a large
+    // or hi-DPI panel, but capped so a full pipeline pass stays fluid for slider
+    // drags (measured: 45 MP CR3 → ~130 ms at 2560 px long edge, ~70 ms at 1920).
+    // True full resolution is served by the 1:1 tile at 100%+ zoom
+    // (DevelopProcessor.RenderRegion); export always re-decodes at full res.
+    private const int DefaultPreviewLong = 1920;
+    private const int MinPreviewLong = 1280;
+    private const int MaxPreviewLong = 2560;
 
     private readonly DispatcherTimer _debounce;
     private CancellationTokenSource? _renderCts;
@@ -43,14 +48,115 @@ public sealed partial class MainViewModel : ObservableObject
     private BitmapSource? _currentRender;    // latest edited render; what After shows
     private ExportSettings _lastExport = new();   // remembered between Export… dialog opens
 
+    // ── Full-resolution 1:1 view ────────────────────────────────────────────
+    // The preview above is a downsample; when the user zooms to 100% the viewer
+    // asks for real sensor pixels over just the visible window. _full is the
+    // sensor-resolution decode (loaded lazily in the background after the
+    // preview appears); _fullDeveloped is that buffer with the current geometry
+    // baked in, cached so a slider drag re-renders only the tile — see
+    // DevelopProcessor.RenderRegion.
+    private LinearRawImage? _full;
+    private LinearRawImage? _fullDeveloped;
+    private GeometrySettings _fullDevelopedGeometry = new();
+    // A copy of _fullDeveloped downsampled to the current zoom's display
+    // resolution. This is what makes every zoom sharp, not just 100%+: the tile is
+    // rendered from a buffer that already has exactly the pixels the screen needs
+    // for this zoom — full sensor pixels at 100%, fewer as you zoom out — so it is
+    // never upscaled. Cached by (geometry, long edge) so editing at a fixed zoom
+    // only re-runs the tile.
+    private LinearRawImage? _scaledDeveloped;
+    private GeometrySettings _scaledDevelopedGeometry = new();
+    private int _scaledDevelopedLong;
+    private readonly object _fullDevelopedLock = new();
+    private CancellationTokenSource? _detailCts;
+    private PixelRect _detailRoi;
+    private double _detailScale = 1.0;
+    private bool _detailWanted;
+
+    // ── Adaptive preview resolution (Phase 1) ───────────────────────────────
+    // The half-size decode is kept resident so the preview buffer can be re-derived
+    // at a new size when the viewport grows, without decoding again. _targetPreviewLong
+    // is the long edge the viewer last asked for; the rebuild is debounced.
+    private LinearRawImage? _previewSource;
+    private int _targetPreviewLong = DefaultPreviewLong;
+    private readonly DispatcherTimer _previewResizeDebounce;
+
+    // The developed 1:1 buffers (_fullDeveloped, _scaledDeveloped) can hold up to
+    // ~540 MB on a 45 MP file, yet are only needed while the user is zoomed in. This
+    // timer frees them after a spell of no rendering activity; they rebuild cheaply
+    // from _full (kept resident) on the next tile render. _full itself is not freed —
+    // re-decoding it costs a full-resolution RAW pass, which is the opposite of cheap.
+    private readonly DispatcherTimer _idleFreeTimer;
+    private const double IdleFreeSeconds = 30.0;
+
     public MainViewModel()
     {
         _debounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(40) };
         _debounce.Tick += (_, _) => { _debounce.Stop(); RenderPreview(); };
+        _previewResizeDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(160) };
+        _previewResizeDebounce.Tick += (_, _) => { _previewResizeDebounce.Stop(); RebuildPreviewForViewport(); };
+        _idleFreeTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(IdleFreeSeconds) };
+        _idleFreeTimer.Tick += (_, _) => { _idleFreeTimer.Stop(); InvalidateFullDeveloped(); };
         SelectedCropAspect = CropAspects[0];
         StatusText = RawDecoder.IsAvailable
             ? "Open a RAW photo to begin."
             : "LibRaw native library not found — RAW decoding unavailable.";
+    }
+
+    // ── Adaptive preview sizing ─────────────────────────────────────────────
+
+    /// <summary>
+    /// The viewer's report of how many device pixels its long edge spans, so the
+    /// preview can be built to match instead of being upscaled from a fixed 1920.
+    /// Stored always (it may arrive before any photo); a rebuild is scheduled only
+    /// when a photo is loaded and the change is worth the re-downsample. The viewer
+    /// calls this only while at Fit, so a rebuild — which resets the zoom to Fit as
+    /// the bitmap dimensions change — never interrupts a zoomed-in session.
+    /// </summary>
+    public void SetPreviewLongEdge(int deviceLongEdge)
+    {
+        int target = Math.Clamp(deviceLongEdge, MinPreviewLong, MaxPreviewLong);
+        if (target == _targetPreviewLong) return;
+        _targetPreviewLong = target;
+
+        if (_previewSource is null) return;   // no photo yet; applied on next load
+        _previewResizeDebounce.Stop();
+        _previewResizeDebounce.Start();
+    }
+
+    /// <summary>Width to hand <see cref="LinearRawImage.Downsample"/> so the preview's
+    /// long edge lands near <paramref name="targetLong"/>, never above the source.</summary>
+    private static int PreviewTargetWidth(LinearRawImage source, int targetLong)
+    {
+        int sw = source.Width, sh = source.Height;
+        int desiredLong = Math.Min(targetLong, Math.Max(sw, sh));
+        return sw >= sh ? desiredLong : (int)Math.Ceiling(desiredLong * sw / (double)sh);
+    }
+
+    /// <summary>Re-derive the preview buffer at the current viewport size and
+    /// re-render. Only meaningful changes go through, so a nudge-resize is free.</summary>
+    private void RebuildPreviewForViewport()
+    {
+        var source = _previewSource;
+        if (source is null || !HasPhoto) return;
+
+        int tw = PreviewTargetWidth(source, _targetPreviewLong);
+        // Skip churn: a few percent either way is invisible and not worth a re-downsample.
+        if (_preview is { } cur && Math.Abs(tw - cur.Width) <= Math.Max(8, cur.Width * 0.05)) return;
+
+        _preview = source.Downsample(tw);
+
+        // The neutral (Before) snapshot is tied to the old dimensions.
+        _neutralPreview = null;
+        _neutralGeometry = new GeometrySettings();
+
+        // The crop overlay measures against the preview buffer.
+        OnPropertyChanged(nameof(CropSourceWidth));
+        OnPropertyChanged(nameof(CropSourceHeight));
+        CropVisualsChanged?.Invoke(this, EventArgs.Empty);
+
+        RenderPreview();
+        StatusText = $"{FileName} — {_preview.Width}×{_preview.Height} preview · zoom to 100% for full resolution";
     }
 
     // ── Loaded-photo state ──
@@ -106,6 +212,185 @@ public sealed partial class MainViewModel : ObservableObject
     {
         if (!HasPhoto) return;
         IsShowingBefore = !IsShowingBefore;
+    }
+
+    // ── Full-resolution detail tile (bound by the viewer) ──────────────────
+    /// <summary>The sharp tile for the visible window, or null when it is not
+    /// showing. The viewer places it over the preview.</summary>
+    [ObservableProperty] private BitmapSource? _detailImage;
+
+    /// <summary>Whether the viewer should currently show <see cref="DetailImage"/>
+    /// on top of the downsampled preview.</summary>
+    [ObservableProperty] private bool _detailActive;
+
+    /// <summary>Top-left of the rendered tile, in full-resolution output pixels
+    /// (fractional) — what the viewer uses to register the tile against the photo.</summary>
+    [ObservableProperty] private double _detailOriginX;
+    [ObservableProperty] private double _detailOriginY;
+
+    /// <summary>Tile pixels per full-resolution output pixel: 1 at 100%+, less as
+    /// the user zooms out. The viewer needs it to place the tile at the right size.</summary>
+    [ObservableProperty] private double _detailScaleValue = 1.0;
+
+    /// <summary>True once the sensor-resolution buffer has finished decoding, so
+    /// the viewer can offer the sharp view. Raised on the UI thread.</summary>
+    [ObservableProperty] private bool _detailReady;
+
+    /// <summary>The size of the full-resolution frame the viewer maps pixels
+    /// against — the current geometry's output size over the sensor buffer. Zero
+    /// until the sensor decode lands.</summary>
+    public int DetailFrameWidth
+        => _full is { } f ? ImageGeometry.OutputSize(_geometry, f.Width, f.Height).width : 0;
+    public int DetailFrameHeight
+        => _full is { } f ? ImageGeometry.OutputSize(_geometry, f.Width, f.Height).height : 0;
+
+    /// <summary>
+    /// The viewer's request for the sharp view: render <paramref name="roi"/> (the
+    /// visible window, in full-resolution output pixels) at <paramref name="scale"/>
+    /// tile-pixels per output-pixel — 1.0 at 100%+, the zoom fraction below that so
+    /// the tile carries exactly the pixels the screen shows and is never upscaled.
+    /// When <paramref name="wanted"/> is false the tile is dropped and the preview
+    /// shows through. Called as the user zooms and pans.
+    /// </summary>
+    public void SetDetailRequest(PixelRect roi, double scale, bool wanted)
+    {
+        _detailWanted = wanted && DetailReady && _full is not null;
+        _detailRoi = roi;
+        _detailScale = scale;
+
+        if (!_detailWanted)
+        {
+            _detailCts?.Cancel();
+            if (DetailActive) DetailActive = false;
+            DetailImage = null;
+            return;
+        }
+
+        KickDetailRender();
+    }
+
+    /// <summary>Start (or restart) a render of the current detail window. Cancels
+    /// any in-flight tile — panning and slider drags both outrun a render.</summary>
+    private void KickDetailRender()
+    {
+        if (!_detailWanted || _full is null || MaskPreviewActive) return;
+
+        NoteRenderActivity();   // keep the developed buffers alive while the tile is in use
+
+        // Cancel the previous tile but do not Dispose it: a superseded render may
+        // still be mid-flight, and registering its Parallel.For on a disposed source
+        // throws ObjectDisposedException (which is not OperationCanceledException, so
+        // it escapes the catch). Disposing here would also make the next Cancel()
+        // throw once a render has finished. A CTS with no wait-handle or timer holds
+        // nothing unmanaged, so GC reclaims it once the render lets go of the token.
+        _detailCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _detailCts = cts;
+
+        var settings = CurrentSettings();   // current geometry, masks and sliders
+        var roi = _detailRoi;
+        var scale = _detailScale;
+        var ct = cts.Token;
+
+        Task.Run(() =>
+        {
+            try { RenderDetailTile(settings, roi, scale, ct); }
+            catch (OperationCanceledException) { /* superseded */ }
+        }, ct);
+    }
+
+    private void RenderDetailTile(DevelopSettings settings, PixelRect roi, double scale,
+                                 CancellationToken ct)
+    {
+        var full = _full;
+        if (full is null) return;
+        double ts = Math.Clamp(scale, 0.02, 1.0);
+
+        // Produce the buffer this zoom needs: geometry baked in (cached per
+        // crop/orientation), then downsampled to the display resolution for the
+        // current zoom (cached per long edge). At 100% ts == 1 and both hand back
+        // the full-resolution buffer unchanged, so this reduces to the true 1:1 path.
+        LinearRawImage scaled;
+        double sx, sy;
+        lock (_fullDevelopedLock)
+        {
+            if (_fullDeveloped is null || !_fullDevelopedGeometry.Matches(settings.Geometry))
+            {
+                _fullDeveloped = ImageGeometry.Apply(full, settings.Geometry);
+                _fullDevelopedGeometry = settings.Geometry.Clone();
+                _scaledDeveloped = null;
+            }
+            var developed = _fullDeveloped;
+
+            int fullLong = Math.Max(developed.Width, developed.Height);
+            int targetLong = Math.Max(1, (int)Math.Round(fullLong * ts));
+            // Bucket to 64 px so a continuous zoom doesn't re-downsample every step.
+            targetLong = Math.Min(fullLong, (targetLong + 63) / 64 * 64);
+
+            if (_scaledDeveloped is null || _scaledDevelopedLong != targetLong
+                || !_scaledDevelopedGeometry.Matches(settings.Geometry))
+            {
+                int targetW = developed.Width >= developed.Height
+                    ? targetLong
+                    : (int)Math.Ceiling(targetLong * developed.Width / (double)developed.Height);
+                _scaledDeveloped = developed.Downsample(targetW);
+                _scaledDevelopedLong = targetLong;
+                _scaledDevelopedGeometry = settings.Geometry.Clone();
+            }
+
+            scaled = _scaledDeveloped;
+            // Actual scale achieved (Downsample rounds), used to map the window in.
+            sx = scaled.Width / (double)developed.Width;
+            sy = scaled.Height / (double)developed.Height;
+        }
+
+        // The visible window, mapped from full-output pixels into the scaled buffer
+        // and clamped to it so the returned tile is exactly this rectangle.
+        int rx0 = Math.Clamp((int)Math.Floor(roi.X * sx), 0, scaled.Width);
+        int ry0 = Math.Clamp((int)Math.Floor(roi.Y * sy), 0, scaled.Height);
+        int rx1 = Math.Clamp((int)Math.Ceiling(roi.Right * sx), 0, scaled.Width);
+        int ry1 = Math.Clamp((int)Math.Ceiling(roi.Bottom * sy), 0, scaled.Height);
+        if (rx1 <= rx0) rx1 = Math.Min(scaled.Width, rx0 + 1);
+        if (ry1 <= ry0) ry1 = Math.Min(scaled.Height, ry0 + 1);
+        var scaledRoi = new PixelRect(rx0, ry0, rx1 - rx0, ry1 - ry0);
+
+        ct.ThrowIfCancellationRequested();
+        var bmp = DevelopProcessor.RenderRegion(scaled, settings, scaledRoi, ct);
+        if (ct.IsCancellationRequested) return;
+
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            if (ct.IsCancellationRequested) return;
+            // Report placement in full-output coordinates so the viewer can register
+            // the tile the same way it maps the preview.
+            DetailOriginX = rx0 / sx;
+            DetailOriginY = ry0 / sy;
+            DetailScaleValue = sx;
+            DetailImage = bmp;
+            DetailActive = true;
+        });
+    }
+
+    /// <summary>Restart the idle-free countdown. Called whenever a render happens,
+    /// so the developed 1:1 buffers are only reclaimed after the user goes quiet.</summary>
+    private void NoteRenderActivity()
+    {
+        _idleFreeTimer.Stop();
+        _idleFreeTimer.Start();
+    }
+
+    /// <summary>Drop the cached developed buffers — on a new photo, or when the
+    /// geometry changes and the developed cache is stale.</summary>
+    private void InvalidateFullDeveloped()
+    {
+        lock (_fullDevelopedLock)
+        {
+            _fullDeveloped = null;
+            _fullDevelopedGeometry = new GeometrySettings();
+            _scaledDeveloped = null;
+            _scaledDevelopedGeometry = new GeometrySettings();
+            _scaledDevelopedLong = 0;
+        }
     }
 
     // ── Adjustments (neutral = 0) ──
@@ -626,8 +911,11 @@ public sealed partial class MainViewModel : ObservableObject
     /// one-shot rather than a mode the user has to remember to leave.</summary>
     [ObservableProperty] private bool _isCreatingMask;
 
-    /// <summary>Paint the selected mask's falloff over the photo in red.</summary>
-    [ObservableProperty] private bool _showMaskOverlay = true;
+    /// <summary>Paint the selected mask's falloff over the photo in red. Off by
+    /// default and while editing: it is switched on automatically when a mask is
+    /// placed (so its shape is visible) and dropped again the moment the user
+    /// touches an adjustment slider — see <see cref="OnMaskAdjustmentChanged"/>.</summary>
+    [ObservableProperty] private bool _showMaskOverlay;
 
     /// <summary>Which right-panel tab is showing: 0 = Edit, 1 = Crop, 2 = Masks.</summary>
     [ObservableProperty] private int _selectedPanelTab;
@@ -731,19 +1019,29 @@ public sealed partial class MainViewModel : ObservableObject
         StatusText = "Drag from the full-strength edge toward where the effect should fade out.";
     }
 
+    [RelayCommand]
+    private void BeginRectangleMask()
+    {
+        if (!HasPhoto) return;
+        _pendingMaskKind = MaskKind.Rectangle;
+        IsCreatingMask = true;
+        StatusText = "Drag on the photo to draw a rectangle, from its centre outward.";
+    }
+
     /// <summary>
     /// Called by the overlay at the start of a create drag, with the press point
     /// in normalised image coordinates. Must add the mask and select it before
     /// returning — the same gesture goes straight on to drag out its geometry.
     ///
-    /// <para>The two kinds read the press point differently: a radial treats it
-    /// as the centre and grows outward, a linear treats it as the full-strength
-    /// end and ramps away from it.</para>
+    /// <para>The kinds read the press point differently: a radial or rectangle
+    /// treats it as the centre and grows outward, a linear treats it as the
+    /// full-strength end and ramps away from it.</para>
     /// </summary>
     public void CreateMaskAt(double x, double y)
     {
-        var mask = _pendingMaskKind == MaskKind.Linear
-            ? new MaskSettings
+        var mask = _pendingMaskKind switch
+        {
+            MaskKind.Linear => new MaskSettings
             {
                 Name = NextMaskName("Linear"),
                 Kind = MaskKind.Linear,
@@ -756,8 +1054,21 @@ public sealed partial class MainViewModel : ObservableObject
                     // user has said which way it should run.
                     Length = 0.002,
                 },
-            }
-            : new MaskSettings
+            },
+            MaskKind.Rectangle => new MaskSettings
+            {
+                Name = NextMaskName("Rectangle"),
+                Kind = MaskKind.Rectangle,
+                Rectangle = new RectangleMask
+                {
+                    CenterX = x,
+                    CenterY = y,
+                    HalfWidth = 0.01,
+                    HalfHeight = 0.01,
+                    Feather = 50,
+                },
+            },
+            _ => new MaskSettings
             {
                 Name = NextMaskName("Radial"),
                 Kind = MaskKind.Radial,
@@ -769,7 +1080,8 @@ public sealed partial class MainViewModel : ObservableObject
                     RadiusY = 0.01,
                     Feather = 50,
                 },
-            };
+            },
+        };
 
         AddMask(mask);
         IsCreatingMask = false;
@@ -779,11 +1091,25 @@ public sealed partial class MainViewModel : ObservableObject
     {
         var item = new MaskItem(mask);
         item.Changed += OnMaskChanged;
+        item.AdjustmentChanged += OnMaskAdjustmentChanged;
         Masks.Add(item);
         SelectedMask = item;
+
+        // Show the falloff overlay for a freshly placed mask so its shape is
+        // visible while the user positions it; the first adjustment drops it.
+        ShowMaskOverlay = true;
+
         OnPropertyChanged(nameof(MaskShapes));
         OnPropertyChanged(nameof(IsMaskingActive));
         RaiseMaskVisualsChanged();
+    }
+
+    /// <summary>The user moved an adjustment slider on a mask — they are past
+    /// placing it, so drop the red overlay and leave it off. Reshaping the mask
+    /// does not come through here, so dragging a handle keeps the overlay up.</summary>
+    private void OnMaskAdjustmentChanged(object? sender, EventArgs e)
+    {
+        if (ShowMaskOverlay) ShowMaskOverlay = false;
     }
 
     private void OnMaskChanged(object? sender, EventArgs e)
@@ -812,6 +1138,7 @@ public sealed partial class MainViewModel : ObservableObject
         if (item is null) return;
 
         item.Changed -= OnMaskChanged;
+        item.AdjustmentChanged -= OnMaskAdjustmentChanged;
         int index = Masks.IndexOf(item);
         Masks.Remove(item);
         SelectedMask = Masks.Count == 0
@@ -831,18 +1158,23 @@ public sealed partial class MainViewModel : ObservableObject
         if (item is null) return;
 
         var copy = item.Mask.Clone();
-        copy.Name = NextMaskName(copy.IsLinear ? "Linear" : "Radial");
+        copy.Name = NextMaskName(KindPrefix(copy.Kind));
         // Nudged so the duplicate is visibly a second mask rather than appearing
         // to have done nothing.
-        if (copy.IsLinear)
+        switch (copy.Kind)
         {
-            copy.Linear.CenterX = Math.Clamp(copy.Linear.CenterX + 0.04, 0.0, 1.0);
-            copy.Linear.CenterY = Math.Clamp(copy.Linear.CenterY + 0.04, 0.0, 1.0);
-        }
-        else
-        {
-            copy.Radial.CenterX = Math.Clamp(copy.Radial.CenterX + 0.04, 0.0, 1.0);
-            copy.Radial.CenterY = Math.Clamp(copy.Radial.CenterY + 0.04, 0.0, 1.0);
+            case MaskKind.Linear:
+                copy.Linear.CenterX = Math.Clamp(copy.Linear.CenterX + 0.04, 0.0, 1.0);
+                copy.Linear.CenterY = Math.Clamp(copy.Linear.CenterY + 0.04, 0.0, 1.0);
+                break;
+            case MaskKind.Rectangle:
+                copy.Rectangle.CenterX = Math.Clamp(copy.Rectangle.CenterX + 0.04, 0.0, 1.0);
+                copy.Rectangle.CenterY = Math.Clamp(copy.Rectangle.CenterY + 0.04, 0.0, 1.0);
+                break;
+            default:
+                copy.Radial.CenterX = Math.Clamp(copy.Radial.CenterX + 0.04, 0.0, 1.0);
+                copy.Radial.CenterY = Math.Clamp(copy.Radial.CenterY + 0.04, 0.0, 1.0);
+                break;
         }
 
         AddMask(copy);
@@ -858,9 +1190,20 @@ public sealed partial class MainViewModel : ObservableObject
 
     private string NextMaskName(string prefix) => $"{prefix} {Masks.Count + 1}";
 
+    private static string KindPrefix(MaskKind kind) => kind switch
+    {
+        MaskKind.Linear => "Linear",
+        MaskKind.Rectangle => "Rectangle",
+        _ => "Radial",
+    };
+
     private void ClearMasks()
     {
-        foreach (var item in Masks) item.Changed -= OnMaskChanged;
+        foreach (var item in Masks)
+        {
+            item.Changed -= OnMaskChanged;
+            item.AdjustmentChanged -= OnMaskAdjustmentChanged;
+        }
         Masks.Clear();
         SelectedMask = null;
         IsCreatingMask = false;
@@ -985,8 +1328,12 @@ public sealed partial class MainViewModel : ObservableObject
         var preview = _preview;
         if (preview is null) return;
 
+        NoteRenderActivity();   // an edit is activity — hold off the idle free
+
+        // Cancel but do not Dispose the previous CTS — see KickDetailRender: a
+        // superseded render still holds this token, and disposing it races its
+        // Parallel.For registration (and the next Cancel) into ObjectDisposedException.
         _renderCts?.Cancel();
-        _renderCts?.Dispose();
         var cts = new CancellationTokenSource();
         _renderCts = cts;
         var settings = CurrentSettings();
@@ -1022,6 +1369,11 @@ public sealed partial class MainViewModel : ObservableObject
             }
             catch (OperationCanceledException) { /* superseded by a newer edit */ }
         }, ct);
+
+        // Keep the 1:1 tile in step with the edit. It renders in parallel with the
+        // preview above (both viewport-bounded, both cancellable) and shows the
+        // same settings at native resolution over the visible window.
+        if (_detailWanted && !mask) KickDetailRender();
     }
 
     [RelayCommand]
@@ -1049,13 +1401,30 @@ public sealed partial class MainViewModel : ObservableObject
         FileName = Path.GetFileName(path);
         StatusText = $"Decoding {FileName}…";
 
-        var preview = await Task.Run(() =>
+        // Drop the previous photo's full-resolution buffers and 1:1 tile before
+        // anything can ask for them.
+        _detailCts?.Cancel();
+        _detailWanted = false;
+        DetailReady = false;
+        DetailActive = false;
+        DetailImage = null;
+        _full = null;
+        _previewSource = null;
+        InvalidateFullDeveloped();
+
+        // Decode half-size, then downsample to the viewport-sized preview. The
+        // half-size buffer is kept (_previewSource) so a later window resize can
+        // re-derive the preview at a new size without decoding again.
+        int targetLong = _targetPreviewLong;
+        var (source, preview) = await Task.Run(() =>
         {
-            var full = RawDecoder.DecodeLinearRgb(path, halfSize: true);
-            return full?.Downsample(PreviewWidth);
+            var src = RawDecoder.DecodeLinearRgb(path, halfSize: true);
+            return src is null
+                ? (null, (LinearRawImage?)null)
+                : (src, src.Downsample(PreviewTargetWidth(src, targetLong)));
         });
 
-        if (preview is null)
+        if (source is null || preview is null)
         {
             IsBusy = false;
             HasPhoto = false;
@@ -1064,6 +1433,7 @@ public sealed partial class MainViewModel : ObservableObject
         }
 
         _rawPath = path;
+        _previewSource = source;
         _preview = preview;
 
         // Reset adjustments and the Before toggle *before* flipping HasPhoto so the
@@ -1091,7 +1461,32 @@ public sealed partial class MainViewModel : ObservableObject
         PreviewImage = neutralBmp;
 
         IsBusy = false;
-        StatusText = $"{FileName} — {preview.Width}×{preview.Height} preview · edits apply live";
+        StatusText = $"{FileName} — {preview.Width}×{preview.Height} preview · zoom to 100% for full resolution";
+
+        // Decode the sensor-resolution buffer in the background so a later zoom to
+        // 100% has real pixels ready. The preview is already interactive; this just
+        // lights up the 1:1 view a moment later. Guard against the user having
+        // opened another photo meanwhile.
+        _ = LoadFullResolutionAsync(path);
+    }
+
+    /// <summary>
+    /// Decode <paramref name="path"/> at full sensor resolution for the 1:1 view.
+    /// Runs off the load path so the preview stays instant; on success it flips
+    /// <see cref="DetailReady"/> and lets the viewer offer a true 100% zoom.
+    /// </summary>
+    private async Task LoadFullResolutionAsync(string path)
+    {
+        var full = await Task.Run(() => RawDecoder.DecodeLinearRgb(path, halfSize: false));
+
+        // A newer Open (or a close) superseded this decode — discard it.
+        if (full is null || !string.Equals(path, _rawPath, StringComparison.Ordinal)) return;
+
+        _full = full;
+        InvalidateFullDeveloped();
+        OnPropertyChanged(nameof(DetailFrameWidth));
+        OnPropertyChanged(nameof(DetailFrameHeight));
+        DetailReady = true;   // the viewer watches this to enable 1:1
     }
 
     [RelayCommand]
@@ -1169,10 +1564,23 @@ public sealed partial class MainViewModel : ObservableObject
         var settings = CurrentSettings();
         var rawPath = _rawPath;
         var outPath = dlg.FileName;
+        // Reuse the full-res decode if the background load has landed — it is the
+        // same buffer the exporter would produce, so this skips a 2–5 s re-decode.
+        // Captured here (not read inside Task.Run) so a concurrent Open, which
+        // replaces _full rather than mutating it, cannot null it mid-export.
+        var full = _full;
 
         IsBusy = true;
         StatusText = "Exporting full-resolution JPEG…";
-        bool ok = await Task.Run(() => JpegExporter.ExportJpeg(rawPath, settings, outPath));
+        bool ok = await Task.Run(() =>
+        {
+            if (full is not null)
+            {
+                JpegExporter.ExportJpeg(full, settings, outPath);
+                return true;
+            }
+            return JpegExporter.ExportJpeg(rawPath, settings, outPath);
+        });
         IsBusy = false;
         StatusText = ok
             ? $"Exported → {Path.GetFileName(outPath)}"
@@ -1207,6 +1615,9 @@ public sealed partial class MainViewModel : ObservableObject
         var rawPath = _rawPath;
         var outPath = saveDlg.FileName;
         string space = export.ColorSpace == ExportColorSpace.AdobeRgb ? "Adobe RGB" : "sRGB";
+        // Reuse the resident full-res decode when available (see ExportAsync); it is
+        // the identical buffer, so the exported file is unchanged.
+        var full = _full;
 
         IsBusy = true;
         StatusText = $"Exporting full-resolution {export.Format} · {export.EffectiveBitDepth}-bit · {space}…";
@@ -1214,7 +1625,15 @@ public sealed partial class MainViewModel : ObservableObject
         string? error = null;
         try
         {
-            ok = await Task.Run(() => ImageExporter.Export(rawPath, develop, export, outPath));
+            ok = await Task.Run(() =>
+            {
+                if (full is not null)
+                {
+                    ImageExporter.Export(full, develop, export, outPath);
+                    return true;
+                }
+                return ImageExporter.Export(rawPath, develop, export, outPath);
+            });
         }
         catch (Exception ex)
         {

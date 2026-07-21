@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace Rawr.Develop;
 
 /// <summary>
@@ -167,6 +169,14 @@ public static class Effects
         }
     }
 
+    // The airlight depends only on the buffer contents, yet the tile path used to
+    // re-estimate it on every render — at 100% zoom that walks the whole 45 MP
+    // frame to recompute a number that has not changed since the last drag. Memoise
+    // it on the pixel array itself: the weak table drops the entry when the buffer
+    // is collected, so the preview, full and scaled buffers each keep their own
+    // estimate with no lifetime plumbing, and a repeated drag becomes a table hit.
+    private static readonly ConditionalWeakTable<ushort[], StrongBox<Airlight>> AirlightCache = new();
+
     /// <summary>
     /// Estimate the haze colour from the raw sensor buffer: the average RGB of
     /// the pixels whose dark channel is brightest, which is where the haze is
@@ -189,18 +199,72 @@ public static class Effects
         int n = w * h;
         if (n == 0 || src.Length < n * 3) return default;
 
-        var r = new float[n];
-        var g = new float[n];
-        var b = new float[n];
+        // ConditionalWeakTable serialises the factory per key, so a concurrent pair
+        // of tile renders computes the estimate at most once, then reuses it.
+        return AirlightCache.GetValue(src,
+            key => new StrongBox<Airlight>(ComputeAirlightFromSensor(key, w, h, n))).Value;
+    }
+
+    /// <summary>
+    /// The dark-channel airlight straight off the interleaved sensor buffer, with
+    /// no intermediate float planes — the histogram needs only the per-pixel dark
+    /// value, computable from <paramref name="src"/> directly. This drops the four
+    /// full-frame <c>float[]</c> allocations the plane path made (~720 MB of LOH
+    /// garbage per estimate at 45 MP) to zero. Bit-identical to
+    /// <see cref="EstimateAirlight"/> over the same buffer: the histogram is integer
+    /// so its parallel per-thread merge is order-independent, and the averaging pass
+    /// is kept serial so its double summation runs in the buffer's own order.
+    /// </summary>
+    private static Airlight ComputeAirlightFromSensor(ushort[] src, int w, int h, int n)
+    {
         const float inv = 1f / 65535f;
+        const int Bins = 1024;
+
+        // Pass 1 — histogram of the per-pixel dark channel. Parallel over rows with a
+        // thread-local histogram merged at the end; integer counts make the merge
+        // exact however the rows were partitioned, so the cutoff below is unchanged.
+        var histogram = new int[Bins];
+        Parallel.For(0, h, () => new int[Bins],
+            (y, _, local) =>
+            {
+                int o = y * w * 3;
+                for (int x = 0; x < w; x++, o += 3)
+                {
+                    float d = MathF.Min(src[o] * inv, MathF.Min(src[o + 1] * inv, src[o + 2] * inv));
+                    if (d < 0f) d = 0f; else if (d > 1f) d = 1f;
+                    local[(int)(d * (Bins - 1))]++;
+                }
+                return local;
+            },
+            local => { lock (histogram) { for (int bin = 0; bin < Bins; bin++) histogram[bin] += local[bin]; } });
+
+        int target = Math.Max(1, n / 1000);
+        int seen = 0, cutoff = Bins - 1;
+        for (int bin = Bins - 1; bin >= 0; bin--)
+        {
+            seen += histogram[bin];
+            if (seen >= target) { cutoff = bin; break; }
+        }
+
+        float threshold = cutoff / (float)(Bins - 1);
+
+        // Pass 2 — average the pixels at or above the cutoff. Serial on purpose:
+        // double addition is not associative, so summing in the buffer's own order
+        // is what keeps the result bit-identical to the float-plane path.
+        double sr = 0, sg = 0, sb = 0;
+        int count = 0;
         for (int i = 0; i < n; i++)
         {
             int o = i * 3;
-            r[i] = src[o] * inv;
-            g[i] = src[o + 1] * inv;
-            b[i] = src[o + 2] * inv;
+            float rr = src[o] * inv, gg = src[o + 1] * inv, bb = src[o + 2] * inv;
+            float d = MathF.Min(rr, MathF.Min(gg, bb));
+            if (d < 0f) d = 0f; else if (d > 1f) d = 1f;
+            if (d < threshold) continue;
+            sr += rr; sg += gg; sb += bb; count++;
         }
-        return EstimateAirlight(r, g, b, w, h);
+        if (count == 0) return default;
+
+        return new Airlight((float)(sr / count), (float)(sg / count), (float)(sb / count));
     }
 
     /// <summary>
@@ -363,12 +427,13 @@ public static class Effects
                                          int contextW, int contextH)
     {
         double a = Math.Clamp(amount, 0.0, 100.0) / 100.0;
-        if (a <= 0.0) return new GrainParams(0f, 1f, 0f, false);
 
         // Cell size scales with resolution so the grain is the same size
         // *relative to the picture* in the preview and the export. Grain that
         // was a pixel wide either way would be invisible in a print and
-        // overwhelming on screen.
+        // overwhelming on screen. It is computed even when Amount is zero so a
+        // local grain mask — which force-activates this field to modulate its
+        // amplitude per pixel — still gets valid field geometry to work from.
         double scale = Math.Max(1.0, Math.Min(contextW, contextH) / 1280.0);
         double cell = (1.0 + 5.0 * (Math.Clamp(size, 0.0, 100.0) / 100.0)) * scale;
 
@@ -376,8 +441,14 @@ public static class Effects
             (float)(a * 26.0),
             (float)cell,
             (float)(Math.Clamp(roughness, 0.0, 100.0) / 100.0),
-            true);
+            a > 0.0);
     }
+
+    /// <summary>Full-strength grain amplitude, in luma units, for a given
+    /// amount slider — the per-pixel currency a local grain mask accumulates into.
+    /// Kept next to <see cref="BuildGrain"/> so the two never drift.</summary>
+    public static float GrainAmplitude(double amount)
+        => (float)(Math.Clamp(amount, 0.0, 100.0) / 100.0 * 26.0);
 
     /// <summary>
     /// Add monochrome film grain to RGB planes in place, using absolute image
@@ -393,25 +464,59 @@ public static class Effects
     /// </summary>
     public static void ApplyGrain(float[] r, float[] g, float[] b, int w, int h,
                                   in GrainParams p, ParallelOptions po)
+        => ApplyGrain(r, g, b, w, h, 0, 0, p, null, po);
+
+    /// <summary>
+    /// As the whole-frame <see cref="ApplyGrain(float[],float[],float[],int,int,in GrainParams,ParallelOptions)"/>,
+    /// but for a sub-window whose top-left sits at
+    /// (<paramref name="offsetX"/>, <paramref name="offsetY"/>) in the full frame.
+    /// The lattice is sampled in those absolute coordinates, so a region tile
+    /// carries the exact pattern the whole-frame render would place there — which
+    /// is what keeps a zoomed 1:1 tile identical to the export. See
+    /// <see cref="DevelopProcessor.RenderRegion"/>.
+    /// </summary>
+    public static void ApplyGrain(float[] r, float[] g, float[] b, int w, int h,
+                                  int offsetX, int offsetY, in GrainParams p, ParallelOptions po)
+        => ApplyGrain(r, g, b, w, h, offsetX, offsetY, p, null, po);
+
+    /// <summary>
+    /// As the offset overload, but with an optional per-pixel amplitude map — one
+    /// grain amount (in luma units, as <see cref="GrainParams.Amount"/>) for each
+    /// pixel of the window. This is how a local grain mask works: the field's
+    /// geometry (cell size, roughness, absolute lattice) stays one thing across
+    /// the whole photograph, and only how <i>much</i> of it shows varies with the
+    /// mask weight. When <paramref name="amounts"/> is null the flat
+    /// <see cref="GrainParams.Amount"/> is used and this is the plain grain pass.
+    /// </summary>
+    public static void ApplyGrain(float[] r, float[] g, float[] b, int w, int h,
+                                  int offsetX, int offsetY, in GrainParams p,
+                                  float[]? amounts, ParallelOptions po)
     {
-        if (!p.IsActive) return;
+        // With a per-pixel map the field may be flat-inactive (global grain 0)
+        // yet still carry grain where a mask adds it, so the map's presence is
+        // itself a reason to run.
+        if (!p.IsActive && amounts is null) return;
 
         float inv1 = 1f / MathF.Max(p.CellPixels, 0.5f);
         float inv2 = 1f / MathF.Max(p.CellPixels * 0.45f, 0.5f);
         float mix2 = p.Roughness * 0.5f;
         float mix1 = 1f - mix2;
-        float amount = p.Amount;
+        float flatAmount = p.Amount;
 
-        var localP = p;
         Parallel.For(0, h, po, y =>
         {
             int row = y * w;
+            float ay = y + offsetY;
             for (int x = 0; x < w; x++)
             {
                 int i = row + x;
+                float amount = amounts is null ? flatAmount : amounts[i];
+                if (amount == 0f) continue;
 
-                float noise = mix1 * ValueNoise(x * inv1, y * inv1, 0)
-                            + mix2 * ValueNoise(x * inv2, y * inv2, 1);
+                float ax = x + offsetX;
+
+                float noise = mix1 * ValueNoise(ax * inv1, ay * inv1, 0)
+                            + mix2 * ValueNoise(ax * inv2, ay * inv2, 1);
                 noise = noise * 2f - (mix1 + mix2);   // centre on zero
 
                 // Fade out of the highlights. Film grain lives in the emulsion's
@@ -534,40 +639,56 @@ public static class Effects
                                    int radius, float eps, ParallelOptions po)
     {
         int n = w * h;
+        // One scratch plane shared by every box blur, blurs done in place — the
+        // pattern Detail.GuidedSmooth adopted after GC, not arithmetic, came to
+        // dominate a slider drag. Five planes instead of the naive eleven.
+        var tmp = new float[n];
         var meanP = new float[n];
-        BoxBlur(src, meanP, w, h, radius, po);
-
         var pp = new float[n];
-        Parallel.For(0, n, po, i => pp[i] = src[i] * src[i]);
-        var meanPP = new float[n];
-        BoxBlur(pp, meanPP, w, h, radius, po);
-
         var a = new float[n];
         var b = new float[n];
-        Parallel.For(0, n, po, i =>
+
+        BoxBlur(src, meanP, tmp, w, h, radius, po);
+
+        Parallel.For(0, h, po, y =>
         {
-            float variance = meanPP[i] - meanP[i] * meanP[i];
-            if (variance < 0f) variance = 0f;
-            float ai = variance / (variance + eps);
-            a[i] = ai;
-            b[i] = (1f - ai) * meanP[i];
+            int row = y * w;
+            for (int x = 0; x < w; x++) { int i = row + x; pp[i] = src[i] * src[i]; }
+        });
+        BoxBlur(pp, pp, tmp, w, h, radius, po);   // pp := mean(p²)
+
+        Parallel.For(0, h, po, y =>
+        {
+            int row = y * w;
+            for (int x = 0; x < w; x++)
+            {
+                int i = row + x;
+                float variance = pp[i] - meanP[i] * meanP[i];
+                if (variance < 0f) variance = 0f;
+                float ai = variance / (variance + eps);
+                a[i] = ai;
+                b[i] = (1f - ai) * meanP[i];
+            }
         });
 
-        var meanA = new float[n];
-        var meanB = new float[n];
-        BoxBlur(a, meanA, w, h, radius, po);
-        BoxBlur(b, meanB, w, h, radius, po);
+        BoxBlur(a, a, tmp, w, h, radius, po);   // a := mean(a)
+        BoxBlur(b, b, tmp, w, h, radius, po);   // b := mean(b)
 
-        Parallel.For(0, n, po, i => baseOut[i] = meanA[i] * src[i] + meanB[i]);
+        Parallel.For(0, h, po, y =>
+        {
+            int row = y * w;
+            for (int x = 0; x < w; x++) { int i = row + x; baseOut[i] = a[i] * src[i] + b[i]; }
+        });
     }
 
     // Sliding-window separable box blur, clamp-extend edges — the same one the
-    // other spatial modules carry.
-    private static void BoxBlur(float[] src, float[] dst, int w, int h, int radius, ParallelOptions po)
+    // other spatial modules carry. <paramref name="scratch"/> holds the horizontal
+    // pass so callers can reuse one plane; src and dst may alias.
+    private static void BoxBlur(float[] src, float[] dst, float[] scratch, int w, int h, int radius, ParallelOptions po)
     {
         int taps = radius * 2 + 1;
         float inv = 1f / taps;
-        var tmp = new float[src.Length];
+        var tmp = scratch;
 
         Parallel.For(0, h, po, y =>
         {
@@ -589,22 +710,38 @@ public static class Effects
             }
         });
 
-        Parallel.For(0, w, po, x =>
+        // Vertical pass, blocked over columns so every read and write is
+        // memory-sequential within a row (the column-at-a-time form touched a new
+        // cache line on every access, re-fetching each line ~16×). Each column's
+        // running sum still accumulates in the exact original order, so the result
+        // is byte-identical; the inner column loops also auto-vectorise.
+        const int block = 64;
+        int nBlocks = (w + block - 1) / block;
+        Parallel.For(0, nBlocks, po, bi =>
         {
-            float sum = 0f;
+            int x0 = bi * block;
+            int bw = Math.Min(block, w - x0);
+            Span<float> sums = stackalloc float[block];
+            sums = sums.Slice(0, bw);
+            sums.Clear();
+
             for (int k = -radius; k <= radius; k++)
             {
                 int yc = k < 0 ? 0 : k >= h ? h - 1 : k;
-                sum += tmp[yc * w + x];
+                int r = yc * w + x0;
+                for (int x = 0; x < bw; x++) sums[x] += tmp[r + x];
             }
             for (int y = 0; y < h; y++)
             {
-                dst[y * w + x] = sum * inv;
+                int d = y * w + x0;
+                for (int x = 0; x < bw; x++) dst[d + x] = sums[x] * inv;
                 int addY = y + radius + 1;
                 int subY = y - radius;
                 if (addY > h - 1) addY = h - 1;
                 if (subY < 0) subY = 0;
-                sum += tmp[addY * w + x] - tmp[subY * w + x];
+                int ar = addY * w + x0;
+                int sr = subY * w + x0;
+                for (int x = 0; x < bw; x++) sums[x] += tmp[ar + x] - tmp[sr + x];
             }
         });
     }

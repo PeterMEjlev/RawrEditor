@@ -11,6 +11,17 @@ namespace Rawr.Develop;
 /// the global <see cref="DevelopSettings"/> has non-zero neutral points in
 /// Detail.</para>
 ///
+/// <para><b>Effects — Texture, Clarity, Dehaze and Grain — are included</b>,
+/// because each folds cleanly into the crop-and-crossfade model: Texture and
+/// Clarity are luma operators the region re-render already runs, and Dehaze runs
+/// there too against the frame-wide airlight the whole-frame render estimates, so
+/// a masked region dehazes against the same haze colour as everything else. Grain
+/// is the exception the model can't fold — it is laid on after masking, keyed to
+/// absolute frame position so it never tiles — so a local Grain offset instead
+/// modulates the amplitude of that one global grain field inside the mask; its
+/// character (Size, Roughness) stays global, exactly as Lightroom's local grain
+/// behaves.</para>
+///
 /// <para>Detail (sharpening, noise reduction) and the Colour Mixer are
 /// deliberately absent. Both are available globally; locally they would each
 /// need the mask to carry its own spatial pass, and the compositing model here
@@ -34,17 +45,30 @@ public sealed class MaskAdjustments
     public double Vibrance { get; set; }
     public double Saturation { get; set; }
 
+    // ── Effects ───────────────────────────────────────────────────────────────
+    public double Texture { get; set; }
+    public double Clarity { get; set; }
+    public double Dehaze { get; set; }
+
+    /// <summary>Offset to the grain <i>amount</i> in the masked region. Grain's
+    /// Size and Roughness are global — see the class remarks — so only the amount
+    /// is local; the compositor turns this into a per-pixel amplitude on the one
+    /// global grain field rather than a second field of its own.</summary>
+    public double Grain { get; set; }
+
     public MaskAdjustments Clone() => (MaskAdjustments)MemberwiseClone();
 
     public bool IsNeutral =>
         Exposure == 0 && Contrast == 0 && Highlights == 0 && Shadows == 0 &&
         Whites == 0 && Blacks == 0 && Temperature == 0 && Tint == 0 &&
-        Vibrance == 0 && Saturation == 0;
+        Vibrance == 0 && Saturation == 0 &&
+        Texture == 0 && Clarity == 0 && Dehaze == 0 && Grain == 0;
 
     public void Reset()
     {
         Exposure = Contrast = Highlights = Shadows = Whites = Blacks =
             Temperature = Tint = Vibrance = Saturation = 0;
+        Texture = Clarity = Dehaze = Grain = 0;
     }
 
     /// <summary>
@@ -80,6 +104,14 @@ public sealed class MaskAdjustments
         s.Vibrance = Clamp100(s.Vibrance + Vibrance);
         s.Saturation = Clamp100(s.Saturation + Saturation);
 
+        // Texture, Clarity and Dehaze fold in like the tone sliders — clamped to
+        // the ±100 the operators are calibrated over. Grain is deliberately not
+        // folded here: it is applied after masking, so the compositor reads this
+        // offset directly to modulate the global grain field's amplitude.
+        s.Texture = Clamp100(s.Texture + Texture);
+        s.Clarity = Clamp100(s.Clarity + Clarity);
+        s.Dehaze = Clamp100(s.Dehaze + Dehaze);
+
         if (Temperature != 0.0)
         {
             double relative = WhiteBalance.KelvinToTemperature(global.EffectiveKelvin) + Temperature;
@@ -98,6 +130,7 @@ public enum MaskKind
 {
     Radial,
     Linear,
+    Rectangle,
 }
 
 /// <summary>
@@ -127,10 +160,13 @@ public sealed class MaskSettings
 
     public LinearGradientMask Linear { get; set; } = new();
 
+    public RectangleMask Rectangle { get; set; } = new();
+
     public MaskAdjustments Adjustments { get; set; } = new();
 
     public bool IsRadial => Kind == MaskKind.Radial;
     public bool IsLinear => Kind == MaskKind.Linear;
+    public bool IsRectangle => Kind == MaskKind.Rectangle;
 
     /// <summary>True when this mask cannot change the render: switched off, or
     /// every adjustment at zero. The renderer skips these outright, so an empty
@@ -141,6 +177,7 @@ public sealed class MaskSettings
     public PixelRect Bounds(int imageWidth, int imageHeight) => Kind switch
     {
         MaskKind.Linear => Linear.Bounds(imageWidth, imageHeight),
+        MaskKind.Rectangle => Rectangle.Bounds(imageWidth, imageHeight),
         _ => Radial.Bounds(imageWidth, imageHeight),
     };
 
@@ -148,6 +185,7 @@ public sealed class MaskSettings
     public float[] Weights(int imageWidth, int imageHeight, PixelRect rect) => Kind switch
     {
         MaskKind.Linear => Linear.Weights(imageWidth, imageHeight, rect),
+        MaskKind.Rectangle => Rectangle.Weights(imageWidth, imageHeight, rect),
         _ => Radial.Weights(imageWidth, imageHeight, rect),
     };
 
@@ -158,6 +196,7 @@ public sealed class MaskSettings
         Kind = Kind,
         Radial = Radial.Clone(),
         Linear = Linear.Clone(),
+        Rectangle = Rectangle.Clone(),
         Adjustments = Adjustments.Clone(),
     };
 }

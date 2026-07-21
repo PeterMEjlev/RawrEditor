@@ -83,10 +83,13 @@ public sealed class LinearRawImage
                     }
                 }
                 long count = (long)(sy1 - sy0) * (sx1 - sx0);
+                long half = count >> 1;
                 int d = dstRow + x * 3;
-                dst[d] = (ushort)(sumR / count);
-                dst[d + 1] = (ushort)(sumG / count);
-                dst[d + 2] = (ushort)(sumB / count);
+                // Round to nearest rather than truncating: truncation biases every
+                // downsampled pixel low by ~half an LSB. +half before the divide.
+                dst[d] = (ushort)((sumR + half) / count);
+                dst[d + 1] = (ushort)((sumG + half) / count);
+                dst[d + 2] = (ushort)((sumB + half) / count);
             }
         });
 

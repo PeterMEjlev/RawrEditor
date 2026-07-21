@@ -28,6 +28,7 @@ public sealed partial class MaskItem : ObservableObject
 
     private RadialMask Radial => Mask.Radial;
     private LinearGradientMask Linear => Mask.Linear;
+    private RectangleMask Rectangle => Mask.Rectangle;
     private MaskAdjustments Adjustments => Mask.Adjustments;
 
     /// <summary>Which shape rows the panel should show. Fixed for a mask's
@@ -35,15 +36,34 @@ public sealed partial class MaskItem : ObservableObject
     /// sensible translation, so the panel offers a new mask instead.</summary>
     public bool IsRadial => Mask.IsRadial;
     public bool IsLinear => Mask.IsLinear;
+    public bool IsRectangle => Mask.IsRectangle;
+
+    /// <summary>Whether the Feather row applies — the closed shapes (radial and
+    /// rectangle) carry one; a linear ramp's own width <i>is</i> its feather.</summary>
+    public bool HasFeather => Mask.IsRadial || Mask.IsRectangle;
 
     /// <summary>Raised whenever an edit here should cause a re-render.</summary>
     public event EventHandler? Changed;
+
+    /// <summary>Raised only when one of the <i>adjustment</i> sliders (Light,
+    /// Color, Effects) moves — not when the shape is reshaped. The panel uses it
+    /// to drop the red overlay once the user stops placing the mask and starts
+    /// actually editing through it, the way Lightroom does.</summary>
+    public event EventHandler? AdjustmentChanged;
 
     private void Edit(Action apply, string propertyName)
     {
         apply();
         OnPropertyChanged(propertyName);
         Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void EditAdjustment(Action apply, string propertyName)
+    {
+        apply();
+        OnPropertyChanged(propertyName);
+        Changed?.Invoke(this, EventArgs.Empty);
+        AdjustmentChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public string Name
@@ -67,10 +87,20 @@ public sealed partial class MaskItem : ObservableObject
 
     // ── Shape ───────────────────────────────────────────────────────────────
 
+    /// <summary>Routes to whichever closed shape this mask is — both the radial
+    /// and the rectangle feather, and the panel binds one row for it.</summary>
     public double Feather
     {
-        get => Radial.Feather;
-        set { if (Radial.Feather != value) Edit(() => Radial.Feather = value, nameof(Feather)); }
+        get => Mask.IsRectangle ? Rectangle.Feather : Radial.Feather;
+        set
+        {
+            if (Feather == value) return;
+            Edit(() =>
+            {
+                if (Mask.IsRectangle) Rectangle.Feather = value;
+                else Radial.Feather = value;
+            }, nameof(Feather));
+        }
     }
 
     /// <summary>Width of a linear gradient's transition, as a percentage of the
@@ -96,13 +126,19 @@ public sealed partial class MaskItem : ObservableObject
     /// Invert, and the panel binds one row for it.</summary>
     public bool Invert
     {
-        get => Mask.IsLinear ? Linear.Invert : Radial.Invert;
+        get => Mask.Kind switch
+        {
+            MaskKind.Linear => Linear.Invert,
+            MaskKind.Rectangle => Rectangle.Invert,
+            _ => Radial.Invert,
+        };
         set
         {
             if (Invert == value) return;
             Edit(() =>
             {
                 if (Mask.IsLinear) Linear.Invert = value;
+                else if (Mask.IsRectangle) Rectangle.Invert = value;
                 else Radial.Invert = value;
             }, nameof(Invert));
         }
@@ -113,37 +149,37 @@ public sealed partial class MaskItem : ObservableObject
     public double Exposure
     {
         get => Adjustments.Exposure;
-        set { if (Adjustments.Exposure != value) Edit(() => Adjustments.Exposure = value, nameof(Exposure)); }
+        set { if (Adjustments.Exposure != value) EditAdjustment(() => Adjustments.Exposure = value, nameof(Exposure)); }
     }
 
     public double Contrast
     {
         get => Adjustments.Contrast;
-        set { if (Adjustments.Contrast != value) Edit(() => Adjustments.Contrast = value, nameof(Contrast)); }
+        set { if (Adjustments.Contrast != value) EditAdjustment(() => Adjustments.Contrast = value, nameof(Contrast)); }
     }
 
     public double Highlights
     {
         get => Adjustments.Highlights;
-        set { if (Adjustments.Highlights != value) Edit(() => Adjustments.Highlights = value, nameof(Highlights)); }
+        set { if (Adjustments.Highlights != value) EditAdjustment(() => Adjustments.Highlights = value, nameof(Highlights)); }
     }
 
     public double Shadows
     {
         get => Adjustments.Shadows;
-        set { if (Adjustments.Shadows != value) Edit(() => Adjustments.Shadows = value, nameof(Shadows)); }
+        set { if (Adjustments.Shadows != value) EditAdjustment(() => Adjustments.Shadows = value, nameof(Shadows)); }
     }
 
     public double Whites
     {
         get => Adjustments.Whites;
-        set { if (Adjustments.Whites != value) Edit(() => Adjustments.Whites = value, nameof(Whites)); }
+        set { if (Adjustments.Whites != value) EditAdjustment(() => Adjustments.Whites = value, nameof(Whites)); }
     }
 
     public double Blacks
     {
         get => Adjustments.Blacks;
-        set { if (Adjustments.Blacks != value) Edit(() => Adjustments.Blacks = value, nameof(Blacks)); }
+        set { if (Adjustments.Blacks != value) EditAdjustment(() => Adjustments.Blacks = value, nameof(Blacks)); }
     }
 
     // ── Color ───────────────────────────────────────────────────────────────
@@ -151,25 +187,51 @@ public sealed partial class MaskItem : ObservableObject
     public double Temperature
     {
         get => Adjustments.Temperature;
-        set { if (Adjustments.Temperature != value) Edit(() => Adjustments.Temperature = value, nameof(Temperature)); }
+        set { if (Adjustments.Temperature != value) EditAdjustment(() => Adjustments.Temperature = value, nameof(Temperature)); }
     }
 
     public double Tint
     {
         get => Adjustments.Tint;
-        set { if (Adjustments.Tint != value) Edit(() => Adjustments.Tint = value, nameof(Tint)); }
+        set { if (Adjustments.Tint != value) EditAdjustment(() => Adjustments.Tint = value, nameof(Tint)); }
     }
 
     public double Vibrance
     {
         get => Adjustments.Vibrance;
-        set { if (Adjustments.Vibrance != value) Edit(() => Adjustments.Vibrance = value, nameof(Vibrance)); }
+        set { if (Adjustments.Vibrance != value) EditAdjustment(() => Adjustments.Vibrance = value, nameof(Vibrance)); }
     }
 
     public double Saturation
     {
         get => Adjustments.Saturation;
-        set { if (Adjustments.Saturation != value) Edit(() => Adjustments.Saturation = value, nameof(Saturation)); }
+        set { if (Adjustments.Saturation != value) EditAdjustment(() => Adjustments.Saturation = value, nameof(Saturation)); }
+    }
+
+    // ── Effects ─────────────────────────────────────────────────────────────
+
+    public double Texture
+    {
+        get => Adjustments.Texture;
+        set { if (Adjustments.Texture != value) EditAdjustment(() => Adjustments.Texture = value, nameof(Texture)); }
+    }
+
+    public double Clarity
+    {
+        get => Adjustments.Clarity;
+        set { if (Adjustments.Clarity != value) EditAdjustment(() => Adjustments.Clarity = value, nameof(Clarity)); }
+    }
+
+    public double Dehaze
+    {
+        get => Adjustments.Dehaze;
+        set { if (Adjustments.Dehaze != value) EditAdjustment(() => Adjustments.Dehaze = value, nameof(Dehaze)); }
+    }
+
+    public double Grain
+    {
+        get => Adjustments.Grain;
+        set { if (Adjustments.Grain != value) EditAdjustment(() => Adjustments.Grain = value, nameof(Grain)); }
     }
 
     /// <summary>Reset the adjustments but keep the shape — the common case when
@@ -187,6 +249,10 @@ public sealed partial class MaskItem : ObservableObject
         OnPropertyChanged(nameof(Tint));
         OnPropertyChanged(nameof(Vibrance));
         OnPropertyChanged(nameof(Saturation));
+        OnPropertyChanged(nameof(Texture));
+        OnPropertyChanged(nameof(Clarity));
+        OnPropertyChanged(nameof(Dehaze));
+        OnPropertyChanged(nameof(Grain));
         Changed?.Invoke(this, EventArgs.Empty);
     }
 

@@ -301,41 +301,56 @@ public static class LocalHighlights
                                    int radius, float eps, ParallelOptions po)
     {
         int n = w * h;
+        // One scratch plane shared by every box blur, blurs done in place — the
+        // GC-churn lesson Detail.GuidedSmooth already learned. Byte-identical.
+        var tmp = new float[n];
         var meanP = new float[n];
-        BoxBlur(src, meanP, w, h, radius, po);
-
         var pp = new float[n];
-        Parallel.For(0, n, po, i => pp[i] = src[i] * src[i]);
-        var meanPP = new float[n];
-        BoxBlur(pp, meanPP, w, h, radius, po);
-
         var a = new float[n];
         var b = new float[n];
-        Parallel.For(0, n, po, i =>
+
+        BoxBlur(src, meanP, tmp, w, h, radius, po);
+
+        Parallel.For(0, h, po, y =>
         {
-            float var = meanPP[i] - meanP[i] * meanP[i];
-            if (var < 0f) var = 0f;
-            float ai = var / (var + eps);
-            a[i] = ai;
-            b[i] = (1f - ai) * meanP[i];
+            int row = y * w;
+            for (int x = 0; x < w; x++) { int i = row + x; pp[i] = src[i] * src[i]; }
+        });
+        BoxBlur(pp, pp, tmp, w, h, radius, po);   // pp := mean(p²)
+
+        Parallel.For(0, h, po, y =>
+        {
+            int row = y * w;
+            for (int x = 0; x < w; x++)
+            {
+                int i = row + x;
+                float variance = pp[i] - meanP[i] * meanP[i];
+                if (variance < 0f) variance = 0f;
+                float ai = variance / (variance + eps);
+                a[i] = ai;
+                b[i] = (1f - ai) * meanP[i];
+            }
         });
 
-        var meanA = new float[n];
-        var meanB = new float[n];
-        BoxBlur(a, meanA, w, h, radius, po);
-        BoxBlur(b, meanB, w, h, radius, po);
+        BoxBlur(a, a, tmp, w, h, radius, po);   // a := mean(a)
+        BoxBlur(b, b, tmp, w, h, radius, po);   // b := mean(b)
 
-        Parallel.For(0, n, po, i => baseOut[i] = meanA[i] * src[i] + meanB[i]);
+        Parallel.For(0, h, po, y =>
+        {
+            int row = y * w;
+            for (int x = 0; x < w; x++) { int i = row + x; baseOut[i] = a[i] * src[i] + b[i]; }
+        });
     }
 
     // Sliding-window separable box blur, horizontal then vertical, clamp-extend
     // edges. Kept local so the module is self-contained (same pattern as
-    // EdgeAwareLuma / DevelopProcessor).
-    private static void BoxBlur(float[] src, float[] dst, int w, int h, int radius, ParallelOptions po)
+    // EdgeAwareLuma / DevelopProcessor). <paramref name="scratch"/> holds the
+    // horizontal pass so callers can reuse one plane; src and dst may alias.
+    private static void BoxBlur(float[] src, float[] dst, float[] scratch, int w, int h, int radius, ParallelOptions po)
     {
         int taps = radius * 2 + 1;
         float inv = 1f / taps;
-        var tmp = new float[src.Length];
+        var tmp = scratch;
 
         Parallel.For(0, h, po, y =>
         {
@@ -357,22 +372,36 @@ public static class LocalHighlights
             }
         });
 
-        Parallel.For(0, w, po, x =>
+        // Vertical pass, blocked over columns so every read and write is
+        // memory-sequential within a row. Each column's running sum accumulates in
+        // the exact original order, so the result is byte-identical.
+        const int block = 64;
+        int nBlocks = (w + block - 1) / block;
+        Parallel.For(0, nBlocks, po, bi =>
         {
-            float sum = 0f;
+            int x0 = bi * block;
+            int bw = Math.Min(block, w - x0);
+            Span<float> sums = stackalloc float[block];
+            sums = sums.Slice(0, bw);
+            sums.Clear();
+
             for (int k = -radius; k <= radius; k++)
             {
                 int yc = k < 0 ? 0 : k >= h ? h - 1 : k;
-                sum += tmp[yc * w + x];
+                int r = yc * w + x0;
+                for (int x = 0; x < bw; x++) sums[x] += tmp[r + x];
             }
             for (int y = 0; y < h; y++)
             {
-                dst[y * w + x] = sum * inv;
+                int d = y * w + x0;
+                for (int x = 0; x < bw; x++) dst[d + x] = sums[x] * inv;
                 int addY = y + radius + 1;
                 int subY = y - radius;
                 if (addY > h - 1) addY = h - 1;
                 if (subY < 0) subY = 0;
-                sum += tmp[addY * w + x] - tmp[subY * w + x];
+                int ar = addY * w + x0;
+                int sr = subY * w + x0;
+                for (int x = 0; x < bw; x++) sums[x] += tmp[ar + x] - tmp[sr + x];
             }
         });
     }

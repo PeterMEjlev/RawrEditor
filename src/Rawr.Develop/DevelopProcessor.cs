@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Rawr.Raw;
@@ -57,19 +58,47 @@ public static class DevelopProcessor
     {
         var po = new ParallelOptions { CancellationToken = ct };
         var (w, h, r, g, b) = BuildRgbPlanes(raw, s, po, ct);
-        int stride = w * 3;
-        byte[] bgr = new byte[h * stride];
+        return QuantizeBgr24Window(r, g, b, w, 0, 0, w, h, 0, po, ct);
+    }
 
-        Parallel.For(0, h, po, yy =>
+    /// <summary>
+    /// Dither and quantise a sub-window of fractional 8-bit sRGB planes into a
+    /// frozen Bgr24 <see cref="BitmapSource"/>.
+    ///
+    /// <para>The planes are sized <paramref name="planeStride"/> wide; the window
+    /// starts at (<paramref name="srcX0"/>, <paramref name="srcY0"/>) within them
+    /// and is <paramref name="outW"/>×<paramref name="outH"/>. The per-row dither
+    /// seed is taken from the <i>absolute</i> output row
+    /// (<paramref name="absRowBase"/> + local row), so a windowed render dithers
+    /// byte-for-byte the same as the whole-frame render of the same content — the
+    /// property the region-render parity test relies on. <see cref="Render"/> is
+    /// just the full-frame case (window = the whole plane, absRowBase = 0).</para>
+    /// </summary>
+    private static BitmapSource QuantizeBgr24Window(
+        float[] r, float[] g, float[] b, int planeStride,
+        int srcX0, int srcY0, int outW, int outH, int absRowBase,
+        ParallelOptions po, CancellationToken ct)
+    {
+        int stride = outW * 3;
+        // Rent the scratch buffer: BitmapSource.Create copies it eagerly, so it can
+        // be returned to the pool the moment Create returns — this buffer is churned
+        // once per render (~11 MB at 2560×1440), previously a fresh LOH allocation
+        // each frame. Rented arrays may be longer than requested; Create reads only
+        // outH * stride bytes, so the extra tail is harmless.
+        int size = outH * stride;
+        byte[] bgr = ArrayPool<byte>.Shared.Rent(size);
+        try
         {
-            // Per-row XorShift seed (Knuth constant + offset) — independent
-            // deterministic dither stream per row, scheduling-invariant.
-            uint rng = unchecked((uint)yy * 2654435761u + 0x12345678u);
+        Parallel.For(0, outH, po, oy =>
+        {
+            // Per-row XorShift seed (Knuth constant + offset) keyed to the absolute
+            // output row — independent, deterministic, scheduling- and window-invariant.
+            uint rng = unchecked((uint)(absRowBase + oy) * 2654435761u + 0x12345678u);
             if (rng == 0) rng = 1;
 
-            int row = yy * stride;
-            int rowI = yy * w;
-            for (int x = 0; x < w; x++)
+            int row = oy * stride;
+            int rowI = (srcY0 + oy) * planeStride + srcX0;
+            for (int x = 0; x < outW; x++)
             {
                 int i = rowI + x;
                 float lr = r[i];
@@ -105,9 +134,108 @@ public static class DevelopProcessor
         });
 
         ct.ThrowIfCancellationRequested();
-        var result = BitmapSource.Create(w, h, 96, 96, PixelFormats.Bgr24, null, bgr, stride);
+        var result = BitmapSource.Create(outW, outH, 96, 96, PixelFormats.Bgr24, null, bgr, stride);
         result.Freeze();
         return result;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(bgr);
+        }
+    }
+
+    /// <summary>
+    /// Render a rectangular window of a <b>full-resolution</b>, already-developed
+    /// image at native resolution — the editor's Lightroom-style 1:1 view.
+    ///
+    /// <para><paramref name="developed"/> is the sensor buffer with geometry
+    /// (crop / straighten / orientation) <i>already applied</i>: it is the frame
+    /// the viewer shows, in the same coordinates the on-screen box uses. Caching
+    /// that buffer is the caller's job (it changes only when the geometry does),
+    /// so a slider drag re-renders just the visible tile and never re-runs the
+    /// geometry pass. <paramref name="roi"/> is the window to render, in that
+    /// buffer's pixels.</para>
+    ///
+    /// <para><b>Cost is bounded by the window, not the sensor.</b> Only
+    /// <paramref name="roi"/> (padded for the spatial filters, exactly as mask
+    /// compositing pads its crops) is run through the pipeline, so a 1:1 tile of a
+    /// 45 MP file costs about what the whole downsampled preview does. The result
+    /// is byte-for-byte the sub-rectangle a full-frame <see cref="Render"/> would
+    /// have produced — same tone maths, same masks, same grain lattice, same
+    /// per-row dither — which is what lets the zoomed view agree with the export
+    /// to the pixel. See <c>RenderRegionTests</c>.</para>
+    /// </summary>
+    public static BitmapSource RenderRegion(LinearRawImage developed, DevelopSettings s,
+                                            PixelRect roi, CancellationToken ct = default)
+    {
+        var po = new ParallelOptions { CancellationToken = ct };
+        int fw = developed.Width, fh = developed.Height;
+
+        // Clamp the requested window to the frame, and never let it collapse to
+        // nothing — a degenerate ROI still has to return a 1 px bitmap rather than
+        // throw from the viewer's paint path.
+        int rx0 = Math.Clamp(roi.X, 0, fw);
+        int ry0 = Math.Clamp(roi.Y, 0, fh);
+        int rx1 = Math.Clamp(roi.Right, 0, fw);
+        int ry1 = Math.Clamp(roi.Bottom, 0, fh);
+        if (rx1 <= rx0) rx1 = Math.Min(fw, rx0 + 1);
+        if (ry1 <= ry0) ry1 = Math.Min(fh, ry0 + 1);
+        var outRect = new PixelRect(rx0, ry0, rx1 - rx0, ry1 - ry0);
+
+        // Pad the window so the spatial filters read real neighbouring pixels at
+        // its edges instead of clamp-extending a false boundary into the tile —
+        // the same padding, sized the same way, that ComposeMasks uses.
+        int regional = Math.Max(EdgeAwareLuma.RegionRadius(fw, fh),
+                       Math.Max(LocalHighlights.RegionRadius(fw, fh), Effects.MaxRegionRadius(fw, fh)));
+        int pad = 2 * regional + 16;
+        int px0 = Math.Max(0, outRect.X - pad);
+        int py0 = Math.Max(0, outRect.Y - pad);
+        int px1 = Math.Min(fw, outRect.Right + pad);
+        int py1 = Math.Min(fh, outRect.Bottom + pad);
+        int padW = px1 - px0, padH = py1 - py0;
+
+        bool wholeFrame = px0 == 0 && py0 == 0 && padW == fw && padH == fh;
+        var region = wholeFrame ? developed : developed.Crop(px0, py0, padW, padH);
+        if (region is null)
+        {
+            var blank = BitmapSource.Create(1, 1, 96, 96, PixelFormats.Bgr24, null, new byte[3], 3);
+            blank.Freeze();
+            return blank;
+        }
+
+        // Geometry is already baked into 'developed'; masks are composited
+        // separately below (mask rectangles are normalised to the full frame, so
+        // they cannot ride inside the tone crop). Everything else — the tone
+        // sliders, Detail, Texture/Clarity/Dehaze — runs over the crop with the
+        // full frame as context so every regional radius matches the whole-frame
+        // render.
+        var tone = s.Clone();
+        tone.Geometry = new GeometrySettings();
+        tone.Masks = new List<MaskSettings>();
+
+        // Dehaze estimates one airlight for the whole photograph; a tile must not
+        // derive its own from a fragment. Estimate it here from the full developed
+        // frame — exactly the buffer and statistic the whole-frame path uses — and
+        // hand it to the tone pass and every mask.
+        Effects.Airlight? airlight = null;
+        if (s.Dehaze != 0.0)
+            airlight = Effects.EstimateAirlightFromSensor(developed.Pixels, fw, fh);
+
+        var (_, _, r, g, b) = RenderRgbPlanes(region, tone, po, ct, fw, fh, ref airlight);
+
+        ComposeMasksRegion(developed, s, r, g, b, px0, py0, padW, padH, po, ct, airlight);
+
+        // Grain last, keyed to absolute frame coordinates so the tile's pattern
+        // registers with the whole-frame render instead of restarting at the crop.
+        // Local grain masks modulate its amplitude over the tile the same way the
+        // whole-frame path does, so a 1:1 tile still matches the export.
+        var grain = Effects.BuildGrain(s.GrainAmount, s.GrainSize, s.GrainRoughness, fw, fh);
+        var grainAmounts = BuildLocalGrainAmounts(s, grain, fw, fh, px0, py0, padW, padH);
+        Effects.ApplyGrain(r, g, b, padW, padH, px0, py0, grain, grainAmounts, po);
+
+        ct.ThrowIfCancellationRequested();
+        return QuantizeBgr24Window(r, g, b, padW,
+            outRect.X - px0, outRect.Y - py0, outRect.Width, outRect.Height, outRect.Y, po, ct);
     }
 
     /// <summary>
@@ -326,10 +454,15 @@ public static class DevelopProcessor
         // rather than of any region, and running it inside each mask's crop
         // would tile the noise field — the pattern is a function of position,
         // so a crop would generate a different one and the mask's outline would
-        // appear as a seam in the grain.
+        // appear as a seam in the grain. A mask that carries a grain offset does
+        // not get its own field: it modulates the amplitude of this one, per
+        // pixel, so the pattern stays continuous across the mask edge.
         var grain = Effects.BuildGrain(s.GrainAmount, s.GrainSize, s.GrainRoughness,
                                        raw.Width, raw.Height);
-        Effects.ApplyGrain(planes.r, planes.g, planes.b, planes.w, planes.h, grain, po);
+        var grainAmounts = BuildLocalGrainAmounts(s, grain, raw.Width, raw.Height,
+                                                   0, 0, planes.w, planes.h);
+        Effects.ApplyGrain(planes.r, planes.g, planes.b, planes.w, planes.h,
+                           0, 0, grain, grainAmounts, po);
 
         return planes;
     }
@@ -543,6 +676,161 @@ public static class DevelopProcessor
     }
 
     /// <summary>
+    /// Per-pixel grain amplitude over a window, or <c>null</c> when no active mask
+    /// carries a grain offset (the common case, kept allocation-free so a photo
+    /// without local grain pays nothing).
+    ///
+    /// <para>Grain cannot ride the crop-and-crossfade path the other adjustments
+    /// use — it is laid on after masking, keyed to absolute position — so a local
+    /// grain offset instead varies the amplitude of the single global field. The
+    /// map starts at the global amount and, for each grain-carrying mask, adds the
+    /// mask's departure from that amount scaled by its weight, exactly the additive
+    /// model <see cref="ComposeMasks"/> uses for tone. Because each contribution is
+    /// a weight-in-0…1 lerp between two non-negative amounts, the result never goes
+    /// negative and needs no clamp.</para>
+    ///
+    /// <para><paramref name="winX"/>/<paramref name="winY"/> place the window in
+    /// full-frame coordinates so the tile path and the whole-frame path build the
+    /// same values for the same pixels.</para>
+    /// </summary>
+    private static float[]? BuildLocalGrainAmounts(DevelopSettings s, in Effects.GrainParams field,
+                                                   int fullW, int fullH,
+                                                   int winX, int winY, int winW, int winH)
+    {
+        if (winW <= 0 || winH <= 0) return null;
+
+        List<MaskSettings>? grainMasks = null;
+        foreach (var mask in s.ActiveMasks)
+            if (mask.Adjustments.Grain != 0.0) (grainMasks ??= new()).Add(mask);
+        if (grainMasks is null) return null;
+
+        float baseAmount = field.Amount;
+        var amounts = new float[winW * winH];
+        Array.Fill(amounts, baseAmount);
+
+        foreach (var mask in grainMasks)
+        {
+            float maskAmount = Effects.GrainAmplitude(s.GrainAmount + mask.Adjustments.Grain);
+            float delta = maskAmount - baseAmount;
+            if (delta == 0f) continue;
+
+            var bounds = mask.Bounds(fullW, fullH);
+            int ax0 = Math.Max(bounds.X, winX);
+            int ay0 = Math.Max(bounds.Y, winY);
+            int ax1 = Math.Min(bounds.Right, winX + winW);
+            int ay1 = Math.Min(bounds.Bottom, winY + winH);
+            if (ax1 <= ax0 || ay1 <= ay0) continue;
+
+            var rect = new PixelRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
+            var weights = mask.Weights(fullW, fullH, rect);
+
+            for (int row = 0; row < rect.Height; row++)
+            {
+                int dst = (ay0 - winY + row) * winW + (ax0 - winX);
+                int wsrc = row * rect.Width;
+                for (int col = 0; col < rect.Width; col++)
+                    amounts[dst + col] += weights[wsrc + col] * delta;
+            }
+        }
+
+        return amounts;
+    }
+
+    /// <summary>
+    /// The region-render counterpart to <see cref="ComposeMasks"/>: composite the
+    /// masks onto a tile's planes rather than the whole frame's.
+    ///
+    /// <para>The planes passed in cover the padded tile
+    /// <paramref name="padW"/>×<paramref name="padH"/> whose top-left is at
+    /// (<paramref name="px0"/>, <paramref name="py0"/>) in the full developed
+    /// frame. Each mask is still rendered over <i>its own</i> padded bounds cut
+    /// from the full frame — so its spatial filters see the same neighbourhood the
+    /// whole-frame render gives them — and its delta is added only where its area
+    /// overlaps this tile. The accumulate-against-the-global-snapshot model is
+    /// identical to <see cref="ComposeMasks"/>, which is why a tile with masks
+    /// still matches the export to the byte.</para>
+    /// </summary>
+    private static void ComposeMasksRegion(LinearRawImage developed, DevelopSettings s,
+                                           float[] r, float[] g, float[] b,
+                                           int px0, int py0, int padW, int padH,
+                                           ParallelOptions po, CancellationToken ct,
+                                           Effects.Airlight? airlight)
+    {
+        int fw = developed.Width, fh = developed.Height;
+
+        var jobs = new List<(MaskSettings mask, PixelRect area)>();
+        foreach (var mask in s.ActiveMasks)
+        {
+            var bounds = mask.Bounds(fw, fh);
+            if (!bounds.IsEmpty) jobs.Add((mask, bounds));
+        }
+        if (jobs.Count == 0) return;
+
+        int regional = Math.Max(EdgeAwareLuma.RegionRadius(fw, fh),
+                       Math.Max(LocalHighlights.RegionRadius(fw, fh), Effects.MaxRegionRadius(fw, fh)));
+        int pad = 2 * regional + 16;
+
+        // Masks measure their departure from the *global* render, so snapshot the
+        // tile's global planes before any mask writes into them. Tile-sized, so a
+        // few MB even at 1:1.
+        var baseR = (float[])r.Clone();
+        var baseG = (float[])g.Clone();
+        var baseB = (float[])b.Clone();
+
+        foreach (var (mask, area) in jobs)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // Where this mask's effect overlaps the tile — nothing to do if disjoint.
+            int ax0 = Math.Max(area.X, px0);
+            int ay0 = Math.Max(area.Y, py0);
+            int ax1 = Math.Min(area.Right, px0 + padW);
+            int ay1 = Math.Min(area.Bottom, py0 + padH);
+            if (ax1 <= ax0 || ay1 <= ay0) continue;
+
+            // The mask's own padded render region, cut from the full frame exactly
+            // as ComposeMasks does.
+            int mpx0 = Math.Max(0, area.X - pad);
+            int mpy0 = Math.Max(0, area.Y - pad);
+            int mpx1 = Math.Min(fw, area.Right + pad);
+            int mpy1 = Math.Min(fh, area.Bottom + pad);
+            int mpadW = mpx1 - mpx0, mpadH = mpy1 - mpy0;
+            if (mpadW <= 0 || mpadH <= 0) continue;
+
+            bool wholeFrame = mpx0 == 0 && mpy0 == 0 && mpadW == fw && mpadH == fh;
+            var mregion = wholeFrame ? developed : developed.Crop(mpx0, mpy0, mpadW, mpadH);
+            if (mregion is null) continue;
+
+            var masked = mask.Adjustments.ApplyTo(s);
+            masked.Masks = new List<MaskSettings>();
+            masked.Geometry = new GeometrySettings();
+
+            var maskAir = airlight;
+            var (_, _, mr, mg, mb) = RenderRgbPlanes(mregion, masked, po, ct, fw, fh, ref maskAir);
+            var weights = mask.Weights(fw, fh, area);
+
+            Parallel.For(ay0, ay1, po, row =>
+            {
+                int weightRow = (row - area.Y) * area.Width;
+                int tileRow = (row - py0) * padW;
+                int maskRow = (row - mpy0) * mpadW;
+                for (int col = ax0; col < ax1; col++)
+                {
+                    float t = weights[weightRow + (col - area.X)];
+                    if (t <= 0f) continue;
+
+                    int k = tileRow + (col - px0);       // tile plane (and snapshot) index
+                    int j = maskRow + (col - mpx0);      // mask render index
+
+                    r[k] += (mr[j] - baseR[k]) * t;
+                    g[k] += (mg[j] - baseG[k]) * t;
+                    b[k] += (mb[j] - baseB[k]) * t;
+                }
+            });
+        }
+    }
+
+    /// <summary>
     /// The shared tone pipeline: per-channel gain → EV-space H/S/C → endpoint
     /// remap → display LUT → luma/chroma decompose → chroma denoise. Returns
     /// the post-blur planes in 0..255 perceptual units (luma) and Rec.709
@@ -634,8 +922,10 @@ public static class DevelopProcessor
 
         // ── Display LUT: normalised linear → fractional 8-bit perceptual ──
         // Pure camera-matched output transform (sRGB → midtone match → base
-        // S). No slider terms — those are the EV-space block above.
-        float[] lut = BuildDisplayLut();
+        // S). No slider terms — those are the EV-space block above. The table is
+        // settings-independent, so it is built once (DisplayLut) and shared by
+        // every render, mask and export pass rather than recomputed each call.
+        float[] lut = DisplayLut;
 
         // ── Pass H (conditional): the stages that need whole planes ──
         // Materialise the gained scene-linear RGB planes, rebuild whatever the
@@ -828,6 +1118,17 @@ public static class DevelopProcessor
     /// render now matches Lightroom rather than the old camera look.
     /// Fractional output is what lets the dither resolve banding into gradient.
     /// </summary>
+    /// <remarks>
+    /// The table has no inputs, so it is computed once into this static and
+    /// handed out read-only to every caller. The CLR guarantees thread-safe
+    /// one-time initialisation of a static readonly field, so no locking is
+    /// needed, and nothing in the pipeline writes to the array (it is only
+    /// indexed in Pass 1), so sharing a single instance is safe. A three-mask
+    /// edit used to rebuild this 65 536-entry transcendental table four times
+    /// per debounce tick; now it never rebuilds after process start.
+    /// </remarks>
+    private static readonly float[] DisplayLut = BuildDisplayLut();
+
     private static float[] BuildDisplayLut()
     {
         var lut = new float[65536];

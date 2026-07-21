@@ -157,6 +157,26 @@
                         </Image.RenderTransform>
                     </Image>
 
+                    <!-- Full-resolution 1:1 tile. Sits directly over the preview
+                         and shows real sensor pixels for the visible window once
+                         the user zooms to 100%+. Positioned by a MatrixTransform
+                         set in ApplyTransform, so it tracks the same pan/zoom the
+                         preview is under. Hit-test invisible so pan and zoom pass
+                         straight through to ViewerHost. -->
+                    <Image x:Name="DetailLayer"
+                           Source="{Binding DetailImage}"
+                           Visibility="{Binding DetailActive, Converter={StaticResource BoolVis}}"
+                           Stretch="None"
+                           HorizontalAlignment="Left"
+                           VerticalAlignment="Top"
+                           RenderTransformOrigin="0,0"
+                           RenderOptions.BitmapScalingMode="HighQuality"
+                           IsHitTestVisible="False">
+                        <Image.RenderTransform>
+                            <MatrixTransform x:Name="DetailTransform" />
+                        </Image.RenderTransform>
+                    </Image>
+
                     <!-- Mask overlay. Sits above the photo and below the status
                          scrims, and mirrors the viewer transform rather than
                          inheriting it so handles keep a constant screen size at
@@ -488,6 +508,8 @@
                                                 <ColumnDefinition Width="*" />
                                                 <ColumnDefinition Width="6" />
                                                 <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="6" />
+                                                <ColumnDefinition Width="*" />
                                             </Grid.ColumnDefinitions>
                                             <Button Grid.Column="0"
                                                     Content="＋  Radial"
@@ -499,6 +521,11 @@
                                                     Command="{Binding BeginLinearMaskCommand}"
                                                     IsEnabled="{Binding HasPhoto}"
                                                     ToolTip="Then drag from the full-strength edge toward where the effect should fade out" />
+                                            <Button Grid.Column="4"
+                                                    Content="＋  Rectangle"
+                                                    Command="{Binding BeginRectangleMaskCommand}"
+                                                    IsEnabled="{Binding HasPhoto}"
+                                                    ToolTip="Then drag on the photo to draw a rectangle, from its centre outward" />
                                         </Grid>
 
                                         <TextBlock Text="No masks yet — add one, then drag on the photo."
@@ -554,14 +581,15 @@
                                                       Margin="0,0,0,8"
                                                       ToolTip="Tint the selected mask red so you can see its falloff" />
 
-                                            <!-- Shape rows differ by kind: a radial has a
-                                                 feather inside a closed outline, a linear
-                                                 ramp's own length *is* its feather. Invert
-                                                 is common to both and routes in the item. -->
+                                            <!-- Shape rows differ by kind: the closed shapes
+                                                 (radial, rectangle) have a feather inside their
+                                                 outline, a linear ramp's own length *is* its
+                                                 feather. Invert is common to all and routes in
+                                                 the item. -->
                                             <ctl:AdjustmentRow Label="Feather"
                                                                Value="{Binding SelectedMask.Feather, Mode=TwoWay}"
                                                                Minimum="0" Maximum="100" Origin="0"
-                                                               Visibility="{Binding SelectedMask.IsRadial,
+                                                               Visibility="{Binding SelectedMask.HasFeather,
                                                                    Converter={StaticResource BoolVis}}" />
 
                                             <StackPanel Visibility="{Binding SelectedMask.IsLinear,
@@ -610,6 +638,24 @@
                                             <ctl:AdjustmentRow Label="Saturation"
                                                                Value="{Binding SelectedMask.Saturation, Mode=TwoWay}"
                                                                TrackBrush="{Binding PresenceTrackBrush, Mode=OneTime}" />
+
+                                            <!-- Effects. Texture/Clarity/Dehaze fold into the
+                                                 region re-render like the tone sliders; Grain
+                                                 is amount-only (Size/Roughness stay global) and
+                                                 modulates the one global grain field. -->
+                                            <TextBlock Text="EFFECTS" Style="{StaticResource SectionCardHeader}" Margin="0,8,0,0" />
+                                            <ctl:AdjustmentRow Label="Texture"
+                                                               Value="{Binding SelectedMask.Texture, Mode=TwoWay}"
+                                                               ToolTip="Fine detail within the mask — negative smooths, positive sharpens" />
+                                            <ctl:AdjustmentRow Label="Clarity"
+                                                               Value="{Binding SelectedMask.Clarity, Mode=TwoWay}"
+                                                               ToolTip="Midtone local contrast within the mask" />
+                                            <ctl:AdjustmentRow Label="Dehaze"
+                                                               Value="{Binding SelectedMask.Dehaze, Mode=TwoWay}"
+                                                               ToolTip="Removes (or adds) haze within the mask, against the whole photo's haze colour" />
+                                            <ctl:AdjustmentRow Label="Grain"
+                                                               Value="{Binding SelectedMask.Grain, Mode=TwoWay}"
+                                                               ToolTip="Adds or removes grain within the mask. Grain Size and Roughness stay global" />
 
                                             <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
                                                 <Button Content="Duplicate"

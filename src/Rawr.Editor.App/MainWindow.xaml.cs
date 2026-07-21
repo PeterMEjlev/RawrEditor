@@ -2,7 +2,10 @@ using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using Rawr.Develop;
 
 namespace Rawr.Editor.App;
 
@@ -30,6 +33,22 @@ public partial class MainWindow : Window
     private const double MinUserScale = 0.2;
     private const double MaxUserScale = 32.0;
     private const double WheelZoomStep = 1.2;
+
+    // ── Sharp detail tile ────────────────────────────────────────────────────
+    // Once the sensor buffer is ready the visible window is rendered at the
+    // resolution the screen needs for the current zoom — full sensor pixels at
+    // 100%+, fewer as you zoom out — so it is sharp at every zoom, not just 100%,
+    // while staying viewport-cheap (the tile is always about a viewport of pixels).
+    // Requests are throttled; placement happens every frame.
+    private readonly DispatcherTimer _detailTimer;
+    private PixelRect _pendingRoi;
+    private PixelRect _lastRequestedRoi;
+    private double _pendingScale = 1.0;
+    private double _lastRequestedScale;
+    private bool _detailActiveRequest;
+
+    private const int DetailMargin = 96;               // render a little past the viewport so small pans stay covered
+    private const long DetailMaxPixels = 24_000_000;   // belt against a pathologically large tile
 
     public MainWindow()
     {
@@ -67,7 +86,13 @@ public partial class MainWindow : Window
                 ApplyTransform();
                 CropOverlay.InvalidateVisual();
             };
+            vm.PropertyChanged += OnViewModelPropertyChanged;
         }
+
+        // Coalesces the flood of transform changes a pan or wheel-zoom produces
+        // into one 1:1 tile request per pause.
+        _detailTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(60) };
+        _detailTimer.Tick += OnDetailTimerTick;
 
         PreviewKeyDown += OnWindowPreviewKeyDown;
     }
@@ -136,6 +161,23 @@ public partial class MainWindow : Window
         // on screen — is a function of the viewport, so the whole transform has
         // to be re-solved on resize even though no zoom or pan happened.
         ApplyTransform();
+        ReportViewportToPreview();
+    }
+
+    /// <summary>
+    /// Tell the view-model how many device pixels the viewport spans so it can size
+    /// the preview buffer to the display rather than upscale a fixed 1920. Only
+    /// while at Fit: rebuilding the preview changes its pixel dimensions, which
+    /// snaps the view back to Fit, so doing it mid-zoom would fight the user.
+    /// </summary>
+    private void ReportViewportToPreview()
+    {
+        if (ViewModel is not { } vm || !IsAtFit()) return;
+        if (ViewerHost.ActualWidth <= 0 || ViewerHost.ActualHeight <= 0) return;
+
+        double dpi = VisualTreeHelper.GetDpi(this).DpiScaleX;
+        double longEdgeDip = Math.Max(ViewerHost.ActualWidth, ViewerHost.ActualHeight);
+        vm.SetPreviewLongEdge((int)Math.Ceiling(longEdgeDip * dpi));
     }
 
     /// <summary>
@@ -252,12 +294,30 @@ public partial class MainWindow : Window
 
     private void OnOneToOneClick(object sender, RoutedEventArgs e)
     {
-        // "100%" = one buffer pixel per screen pixel. Stretch=Uniform's fit
-        // gives us a known fitScale (bitmap-px per viewer-px); we cancel it
-        // out by setting userScale = 1/fitScale.
+        // "100%" = one *sensor* pixel per *device* pixel — the real 1:1 the detail
+        // tile serves. absOut = fit × rotation × userScale × (preview-px per
+        // sensor-px); solve userScale so that product is 1/dpi, i.e. one output
+        // pixel spans exactly one device pixel after WPF's dpi compositing. Until
+        // the sensor buffer has decoded we fall back to buffer-1:1.
+        double dpi = DpiScale();
+        if (ViewModel is { DetailReady: true } vm
+            && ViewerImage.Source is BitmapSource bs && vm.DetailFrameWidth > 0)
+        {
+            double fitPrev = ComputeFitScale() * _rotationFit;
+            double outToPrev = bs.PixelWidth / (double)vm.DetailFrameWidth;
+            if (fitPrev > 0 && outToPrev > 0)
+            {
+                _userScale = Math.Min(MaxUserScale, 1.0 / (fitPrev * outToPrev * dpi));
+                _tx = 0;
+                _ty = 0;
+                ApplyTransform();
+                return;
+            }
+        }
+
         double fitScale = ComputeFitScale() * _rotationFit;
         if (fitScale <= 0) return;
-        _userScale = 1.0 / fitScale;
+        _userScale = 1.0 / (fitScale * dpi);
         _tx = 0;
         _ty = 0;
         ApplyTransform();
@@ -269,6 +329,9 @@ public partial class MainWindow : Window
         _tx = 0;
         _ty = 0;
         ApplyTransform();
+        // Back at Fit, a viewport enlargement deferred during the zoom can now be
+        // honoured — size the preview up to the display if it grew.
+        ReportViewportToPreview();
     }
 
     private double ComputeFitScale()
@@ -282,6 +345,11 @@ public partial class MainWindow : Window
     }
 
     private bool IsAtFit() => Math.Abs(_userScale - 1.0) < 1e-6 && _tx == 0 && _ty == 0;
+
+    /// <summary>Device pixels per DIP for this window (1.0 at 100% scaling, 1.5 at
+    /// 150%, …). Used to make "100%" a true one-sensor-pixel-per-device-pixel view
+    /// and render the detail tile at the resolution the display actually has.</summary>
+    private double DpiScale() => VisualTreeHelper.GetDpi(this).DpiScaleX;
 
     private void ApplyTransform()
     {
@@ -298,6 +366,7 @@ public partial class MainWindow : Window
         ViewerTranslate.Y = _ty;
         SyncOverlays();
         UpdateZoomLabel();
+        UpdateDetailView();
     }
 
     private void UpdateZoomLabel()
@@ -307,9 +376,190 @@ public partial class MainWindow : Window
             ZoomLabel.Text = "Fit";
             return;
         }
-        // Display absolute scale (buffer-pixel : screen-pixel) so "100%" lines
-        // up with the 1:1 button.
-        double absScale = ComputeFitScale() * _rotationFit * _userScale;
-        ZoomLabel.Text = absScale > 0 ? $"{absScale * 100:0}%" : "—";
+        // Report sensor pixels : *device* pixels, so "100%" is a true 1:1 view of the
+        // RAW (matching the 1:1 button and the detail tile). Until the sensor buffer
+        // decodes we can only report against the preview buffer.
+        double dpi = DpiScale();
+        double absPrev = ComputeFitScale() * _rotationFit * _userScale;
+        double pct = absPrev * dpi;
+        if (ViewModel is { DetailReady: true } vm
+            && ViewerImage.Source is BitmapSource bs && vm.DetailFrameWidth > 0)
+            pct = absPrev * (bs.PixelWidth / (double)vm.DetailFrameWidth) * dpi;
+        ZoomLabel.Text = pct > 0 ? $"{pct * 100:0}%" : "—";
+    }
+
+    // ── Full-resolution 1:1 tile ────────────────────────────────────────────
+
+    /// <summary>
+    /// The image→screen mapping the tile needs: <paramref name="absPrev"/> is
+    /// screen-DIP per preview pixel (the scale the preview is drawn at),
+    /// <paramref name="outToPrev"/> is preview pixels per full-resolution output
+    /// pixel, and (<paramref name="prevCx"/>, <paramref name="prevCy"/>) is the
+    /// preview bitmap's centre. Returns false when there is nothing to map yet.
+    /// </summary>
+    private bool TryDetailMapping(out double absPrev, out double outToPrev,
+                                  out double prevCx, out double prevCy,
+                                  out int fullOutW, out int fullOutH)
+    {
+        absPrev = outToPrev = prevCx = prevCy = 0;
+        fullOutW = fullOutH = 0;
+
+        if (ViewModel is not { DetailReady: true } vm) return false;
+        if (ViewerImage.Source is not BitmapSource bs) return false;
+        if (ViewerHost.ActualWidth <= 0 || ViewerHost.ActualHeight <= 0) return false;
+
+        fullOutW = vm.DetailFrameWidth;
+        fullOutH = vm.DetailFrameHeight;
+        if (fullOutW <= 0 || fullOutH <= 0) return false;
+
+        double prevW = bs.PixelWidth, prevH = bs.PixelHeight;
+        double fitPrev = Math.Min(ViewerHost.ActualWidth / prevW, ViewerHost.ActualHeight / prevH);
+        absPrev = fitPrev * _rotationFit * _userScale;
+        outToPrev = prevW / fullOutW;
+        prevCx = prevW / 2;
+        prevCy = prevH / 2;
+        return absPrev > 0 && outToPrev > 0;
+    }
+
+    /// <summary>
+    /// Decide whether the sharp tile should show, ask the view-model for the
+    /// visible window (and the display resolution it needs for the current zoom),
+    /// and keep whatever tile exists registered to the photo under the live
+    /// pan/zoom. Called on every transform change.
+    /// </summary>
+    private void UpdateDetailView()
+    {
+        if (ViewModel is not { } vm) return;
+
+        double absPrev = 0, outToPrev = 0, prevCx = 0, prevCy = 0;
+        int fullOutW = 0, fullOutH = 0;
+        bool wanted = !vm.IsCropActive && !vm.IsShowingBefore
+                      && TryDetailMapping(out absPrev, out outToPrev,
+                                          out prevCx, out prevCy,
+                                          out fullOutW, out fullOutH);
+
+        PixelRect roi = default;
+        double ts = 1.0;
+        if (wanted)
+        {
+            double absOut = absPrev * outToPrev;   // screen-DIP per sensor pixel
+            // Render the tile at the resolution the *device* has, not the DIP count:
+            // on a scaled display one DIP is dpi device pixels, so sampling to DIPs
+            // leaves WPF to upscale the tile (soft). ×dpi lands one tile pixel on one
+            // device pixel; capped at 1:1 — never above sensor res.
+            double absOutDevice = absOut * DpiScale();
+            ts = Math.Min(1.0, absOutDevice);      // never sample above sensor 1:1
+            if (ts <= 0.0)
+            {
+                wanted = false;
+            }
+            else
+            {
+                // Invert the transform at the viewport corners to get the visible
+                // window in full-resolution output pixels.
+                double cx = ViewerHost.ActualWidth / 2, cy = ViewerHost.ActualHeight / 2;
+                double ax = ((0 - cx - _tx) / absPrev + prevCx) / outToPrev;
+                double ay = ((0 - cy - _ty) / absPrev + prevCy) / outToPrev;
+                double bx = ((ViewerHost.ActualWidth - cx - _tx) / absPrev + prevCx) / outToPrev;
+                double by = ((ViewerHost.ActualHeight - cy - _ty) / absPrev + prevCy) / outToPrev;
+
+                int rx0 = Math.Clamp((int)Math.Floor(Math.Min(ax, bx)) - DetailMargin, 0, fullOutW);
+                int ry0 = Math.Clamp((int)Math.Floor(Math.Min(ay, by)) - DetailMargin, 0, fullOutH);
+                int rx1 = Math.Clamp((int)Math.Ceiling(Math.Max(ax, bx)) + DetailMargin, 0, fullOutW);
+                int ry1 = Math.Clamp((int)Math.Ceiling(Math.Max(ay, by)) + DetailMargin, 0, fullOutH);
+
+                // The tile is rendered at ts, so its cost is the scaled window —
+                // about a viewport at any zoom. Guard only against the pathological.
+                long scaledPx = (long)((rx1 - rx0) * ts) * (long)((ry1 - ry0) * ts);
+                if (rx1 <= rx0 || ry1 <= ry0 || scaledPx > DetailMaxPixels)
+                    wanted = false;
+                else
+                    roi = new PixelRect(rx0, ry0, rx1 - rx0, ry1 - ry0);
+            }
+        }
+
+        if (!wanted)
+        {
+            _detailTimer.Stop();
+            if (_detailActiveRequest)
+            {
+                vm.SetDetailRequest(default, 1.0, false);
+                _detailActiveRequest = false;
+                _lastRequestedRoi = default;
+                _lastRequestedScale = 0;
+            }
+            return;
+        }
+
+        // Keep the existing tile glued to the photo as the user drags (cheap).
+        PlaceDetailTile(vm, absPrev, outToPrev, prevCx, prevCy);
+
+        // Re-render when the window moved or the zoom crossed into a new sampling
+        // resolution, throttled so a pan doesn't queue a tile per frame.
+        if (roi != _lastRequestedRoi || Math.Abs(ts - _lastRequestedScale) > 0.01)
+        {
+            _pendingRoi = roi;
+            _pendingScale = ts;
+            _detailTimer.Stop();
+            _detailTimer.Start();
+        }
+    }
+
+    private void OnDetailTimerTick(object? sender, EventArgs e)
+    {
+        _detailTimer.Stop();
+        if (ViewModel is not { } vm) return;
+        vm.SetDetailRequest(_pendingRoi, _pendingScale, true);
+        _lastRequestedRoi = _pendingRoi;
+        _lastRequestedScale = _pendingScale;
+        _detailActiveRequest = true;
+    }
+
+    /// <summary>
+    /// Position the detail tile so its top-left output pixel lands exactly where
+    /// the preview puts that same pixel, and scale it so its pixels cover the same
+    /// screen span the preview would — so the tile overlays the preview in perfect
+    /// register at whatever resolution it was rendered.
+    /// </summary>
+    private void PlaceDetailTile(ViewModels.MainViewModel vm,
+                                 double absPrev, double outToPrev, double prevCx, double prevCy)
+    {
+        double tileScale = vm.DetailScaleValue;   // tile pixels per full-output pixel
+        if (tileScale <= 0.0) return;
+
+        double cx = ViewerHost.ActualWidth / 2, cy = ViewerHost.ActualHeight / 2;
+        double absOut = absPrev * outToPrev;                 // screen-DIP per output pixel
+        double screenPerTilePx = absOut / tileScale;         // screen-DIP per tile pixel
+        double e = cx + (vm.DetailOriginX * outToPrev - prevCx) * absPrev + _tx;
+        double f = cy + (vm.DetailOriginY * outToPrev - prevCy) * absPrev + _ty;
+        DetailTransform.Matrix = new Matrix(screenPerTilePx, 0, 0, screenPerTilePx, e, f);
+    }
+
+    private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        switch (e.PropertyName)
+        {
+            case nameof(ViewModels.MainViewModel.DetailImage):
+                // A fresh tile arrived (from a pan/zoom request or a slider edit).
+                // Register it under the current transform.
+                if (ViewModel is { } vm
+                    && TryDetailMapping(out double ap, out double otp,
+                                        out double pcx, out double pcy, out _, out _))
+                    PlaceDetailTile(vm, ap, otp, pcx, pcy);
+                break;
+
+            case nameof(ViewModels.MainViewModel.DetailReady):
+                // The sensor buffer finished decoding — the label and 1:1 button
+                // switch to true sensor percentages, and a 100%+ view can light up.
+                UpdateZoomLabel();
+                UpdateDetailView();
+                break;
+
+            case nameof(ViewModels.MainViewModel.IsShowingBefore):
+                // Before hides the tile; returning to After has to bring it back,
+                // and neither toggles the viewer transform on its own.
+                UpdateDetailView();
+                break;
+        }
     }
 }

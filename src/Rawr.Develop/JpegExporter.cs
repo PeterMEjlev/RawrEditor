@@ -23,6 +23,20 @@ public static class JpegExporter
         var full = RawDecoder.DecodeLinearRgb(rawPath, halfSize: false);
         if (full is null) return false;
 
+        ExportJpeg(full, settings, outputPath, quality, ct);
+        return true;
+    }
+
+    /// <summary>
+    /// Apply <paramref name="settings"/> to an already-decoded full-resolution
+    /// RAW and write a JPEG. Lets a caller that already holds the sensor-resolution
+    /// buffer (the editor's background full-res decode) skip re-decoding the RAW —
+    /// the buffer is the identical <c>DecodeLinearRgb(path, halfSize: false)</c>
+    /// result, so the saved file is unchanged.
+    /// </summary>
+    public static void ExportJpeg(LinearRawImage full, DevelopSettings settings, string outputPath,
+                                  int quality = 92, CancellationToken ct = default)
+    {
         var rendered = DevelopProcessor.Render(full, settings, ct);
 
         var encoder = new JpegBitmapEncoder { QualityLevel = Math.Clamp(quality, 1, 100) };
@@ -33,6 +47,5 @@ public static class JpegExporter
 
         using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.Write);
         encoder.Save(fs);
-        return true;
     }
 }

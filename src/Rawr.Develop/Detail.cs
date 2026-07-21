@@ -293,22 +293,27 @@ public static class Detail
         float contrast = p.Contrast;
         bool doContrast = contrast > 0f;
 
-        Parallel.For(0, n, po, i =>
+        Parallel.For(0, h, po, y =>
         {
-            float removed = luma[i] - smooth[i];
-            float keep = 1f - strength;
-
-            if (doContrast)
+            int rowBase = y * w;
+            for (int x = 0; x < w; x++)
             {
-                // Give detail back in proportion to how textured the region is, so
-                // Contrast holds micro-structure without also un-smoothing the flat
-                // areas that were the point of running NR at all.
-                float sd = MathF.Sqrt(variance[i]);
-                keep += strength * contrast * SmoothStep(0f, ContrastScale, sd);
-                if (keep > 1f) keep = 1f;
-            }
+                int i = rowBase + x;
+                float removed = luma[i] - smooth[i];
+                float keep = 1f - strength;
 
-            luma[i] = smooth[i] + removed * keep;
+                if (doContrast)
+                {
+                    // Give detail back in proportion to how textured the region is, so
+                    // Contrast holds micro-structure without also un-smoothing the flat
+                    // areas that were the point of running NR at all.
+                    float sd = MathF.Sqrt(variance[i]);
+                    keep += strength * contrast * SmoothStep(0f, ContrastScale, sd);
+                    if (keep > 1f) keep = 1f;
+                }
+
+                luma[i] = smooth[i] + removed * keep;
+            }
         });
     }
 
@@ -326,8 +331,11 @@ public static class Detail
         int radius = ColorRadius(amount);
         if (radius <= 0) return;
 
-        BoxBlurInPlace(cb, w, h, radius, po);
-        BoxBlurInPlace(cr, w, h, radius, po);
+        // One scratch plane shared by both channel blurs, instead of a fresh
+        // allocation inside each call — the same GC-churn lesson as GuidedSmooth.
+        var scratch = new float[w * h];
+        BoxBlur(cb, cb, scratch, w, h, radius, po);
+        BoxBlur(cr, cr, scratch, w, h, radius, po);
     }
 
     /// <summary>Chroma blur radius for a Colour slider value, in pixels.</summary>
@@ -436,27 +444,37 @@ public static class Detail
 
         BoxBlur(src, meanP, tmp, w, h, radius, po);
 
-        Parallel.For(0, n, po, i => pp[i] = src[i] * src[i]);
+        Parallel.For(0, h, po, y =>
+        {
+            int row = y * w;
+            for (int x = 0; x < w; x++) { int i = row + x; pp[i] = src[i] * src[i]; }
+        });
         BoxBlur(pp, pp, tmp, w, h, radius, po);   // pp := mean(p²)
 
-        Parallel.For(0, n, po, i =>
+        Parallel.For(0, h, po, y =>
         {
-            float v = pp[i] - meanP[i] * meanP[i];
-            if (v < 0f) v = 0f;
-            varianceOut[i] = v;
-            float ai = v / (v + eps);
-            a[i] = ai;
-            b[i] = (1f - ai) * meanP[i];
+            int row = y * w;
+            for (int x = 0; x < w; x++)
+            {
+                int i = row + x;
+                float v = pp[i] - meanP[i] * meanP[i];
+                if (v < 0f) v = 0f;
+                varianceOut[i] = v;
+                float ai = v / (v + eps);
+                a[i] = ai;
+                b[i] = (1f - ai) * meanP[i];
+            }
         });
 
         BoxBlur(a, a, tmp, w, h, radius, po);
         BoxBlur(b, b, tmp, w, h, radius, po);
 
-        Parallel.For(0, n, po, i => dst[i] = a[i] * src[i] + b[i]);
+        Parallel.For(0, h, po, y =>
+        {
+            int row = y * w;
+            for (int x = 0; x < w; x++) { int i = row + x; dst[i] = a[i] * src[i] + b[i]; }
+        });
     }
-
-    private static void BoxBlurInPlace(float[] plane, int w, int h, int radius, ParallelOptions po)
-        => BoxBlur(plane, plane, new float[plane.Length], w, h, radius, po);
 
     /// <summary>
     /// Sliding-window separable box blur, clamp-extend edges. Same algorithm as
@@ -496,22 +514,37 @@ public static class Detail
             }
         });
 
-        Parallel.For(0, w, po, x =>
+        // Vertical pass, blocked over columns so every read and write is
+        // memory-sequential within a row (the column-at-a-time form touched a new
+        // cache line on every access). Each column's running sum accumulates in the
+        // exact original order, so the result is byte-identical.
+        const int block = 64;
+        int nBlocks = (w + block - 1) / block;
+        Parallel.For(0, nBlocks, po, bi =>
         {
-            float sum = 0f;
+            int x0 = bi * block;
+            int bw = Math.Min(block, w - x0);
+            Span<float> sums = stackalloc float[block];
+            sums = sums.Slice(0, bw);
+            sums.Clear();
+
             for (int k = -radius; k <= radius; k++)
             {
                 int yc = k < 0 ? 0 : k >= h ? h - 1 : k;
-                sum += tmp[yc * w + x];
+                int r = yc * w + x0;
+                for (int x = 0; x < bw; x++) sums[x] += tmp[r + x];
             }
             for (int y = 0; y < h; y++)
             {
-                dst[y * w + x] = sum * inv;
+                int d = y * w + x0;
+                for (int x = 0; x < bw; x++) dst[d + x] = sums[x] * inv;
                 int addY = y + radius + 1;
                 int subY = y - radius;
                 if (addY > h - 1) addY = h - 1;
                 if (subY < 0) subY = 0;
-                sum += tmp[addY * w + x] - tmp[subY * w + x];
+                int ar = addY * w + x0;
+                int sr = subY * w + x0;
+                for (int x = 0; x < bw; x++) sums[x] += tmp[ar + x] - tmp[sr + x];
             }
         });
     }

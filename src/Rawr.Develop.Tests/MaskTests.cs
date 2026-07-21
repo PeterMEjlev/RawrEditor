@@ -252,6 +252,25 @@ public class MaskTests
         Assert.Equal(-100, result.Blacks, 9);
     }
 
+    /// <summary>
+    /// Texture, Clarity and Dehaze fold into the global settings like the tone
+    /// sliders — added and clamped to the ±100 their operators are fitted over.
+    /// Grain is deliberately <i>not</i> folded here: it is applied after masking,
+    /// so the compositor reads the offset directly rather than through
+    /// <see cref="MaskAdjustments.ApplyTo"/>.
+    /// </summary>
+    [Fact]
+    public void Effects_FoldIntoTheGlobalSliders_ExceptGrain()
+    {
+        var global = new DevelopSettings { Texture = 20, Clarity = -10, Dehaze = 90, GrainAmount = 30 };
+        var result = new MaskAdjustments { Texture = 30, Clarity = -40, Dehaze = 50, Grain = 40 }.ApplyTo(global);
+
+        Assert.Equal(50, result.Texture, 9);
+        Assert.Equal(-50, result.Clarity, 9);
+        Assert.Equal(100, result.Dehaze, 9);          // 90 + 50 clamps to 100
+        Assert.Equal(30, result.GrainAmount, 9);      // untouched by ApplyTo
+    }
+
     [Fact]
     public void NeutralAdjustments_LeaveTheGlobalSettingsAlone()
     {
@@ -554,5 +573,132 @@ public class MaskTests
         // The centre of the left mask is disjoint from the right one.
         int o = Offset(W / 4, H / 2);
         for (int c = 0; c < 3; c++) Assert.Equal(a[o + c], b[o + c]);
+    }
+
+    // ── 6. Local effects ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// A masked Texture/Clarity/Dehaze must land, at full weight, exactly where a
+    /// global render of the same folded settings does — the same crop-parity
+    /// guarantee the tone sliders get, extended to the Effects that ride the same
+    /// region re-render. Sampled across the interior because a radius or padding
+    /// mistake shows up worst near the crop edge.
+    /// </summary>
+    [Fact]
+    public void LocalEffects_MatchAGlobalRenderAcrossTheCropBoundary()
+    {
+        var raw = MakeRaw();
+        var global = new DevelopSettings { Dehaze = 20 };
+        var offsets = new MaskAdjustments { Texture = 60, Clarity = 50, Dehaze = 40 };
+
+        var masked = global.Clone();
+        masked.Masks.Add(CenteredMask(0.14, offsets));
+
+        byte[] viaMask = RenderBytes(raw, masked);
+        byte[] viaGlobal = RenderBytes(raw, offsets.ApplyTo(global));
+
+        for (int dy = -40; dy <= 40; dy += 10)
+        {
+            for (int dx = -40; dx <= 40; dx += 10)
+            {
+                int o = Offset(W / 2 + dx, H / 2 + dy);
+                for (int c = 0; c < 3; c++)
+                    Assert.True(Math.Abs(viaMask[o + c] - viaGlobal[o + c]) <= 1,
+                        $"effects crop/global mismatch at ({W / 2 + dx},{H / 2 + dy}) ch {c}: " +
+                        $"{viaMask[o + c]} vs {viaGlobal[o + c]}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Local grain adds grain <i>inside</i> the mask and nowhere else, even with
+    /// global Grain at zero — the field is force-activated by the mask. The corners
+    /// stay bit-identical to a grainless render; the interior does not.
+    /// </summary>
+    [Fact]
+    public void LocalGrain_AddsGrainInsideTheMaskOnly()
+    {
+        var raw = MakeRaw();
+        var plain = new DevelopSettings();               // no grain anywhere
+        var masked = plain.Clone();
+        masked.Masks.Add(CenteredMask(0.2, new MaskAdjustments { Grain = 100 }));
+
+        byte[] a = RenderBytes(raw, plain);
+        byte[] b = RenderBytes(raw, masked);
+
+        // Outside the mask: untouched to the byte.
+        foreach (var (x, y) in new[] { (0, 0), (W - 1, 0), (0, H - 1), (W - 1, H - 1) })
+        {
+            int o = Offset(x, y);
+            for (int c = 0; c < 3; c++) Assert.Equal(a[o + c], b[o + c]);
+        }
+
+        // Inside: grain has perturbed a meaningful share of the pixels. A single
+        // pixel could sit at a noise zero, so count over a block.
+        int changed = 0;
+        for (int dy = -30; dy <= 30; dy++)
+            for (int dx = -30; dx <= 30; dx++)
+            {
+                int o = Offset(W / 2 + dx, H / 2 + dy);
+                if (a[o] != b[o] || a[o + 1] != b[o + 1] || a[o + 2] != b[o + 2]) changed++;
+            }
+        Assert.True(changed > 200, $"local grain barely changed the interior ({changed} px)");
+    }
+
+    /// <summary>A grain offset of zero adds no grain: with global grain also zero,
+    /// the mask's full-weight interior stays bit-identical to a plain global render
+    /// of the same tone offset. Guards that a zero offset never force-activates the
+    /// field — the fast path that keeps a photo without local grain free.</summary>
+    [Fact]
+    public void LocalGrain_ZeroOffset_AddsNoGrain()
+    {
+        var raw = MakeRaw();
+        var global = new DevelopSettings();
+        var offsets = new MaskAdjustments { Exposure = 0.5, Grain = 0 };
+
+        var masked = global.Clone();
+        masked.Masks.Add(CenteredMask(0.2, offsets));
+
+        byte[] viaMask = RenderBytes(raw, masked);
+        byte[] viaGlobal = RenderBytes(raw, offsets.ApplyTo(global));
+
+        // No grain means the interior matches the deterministic global render to
+        // the byte; a stray grain pass would perturb it.
+        int o = Offset(W / 2, H / 2);
+        for (int c = 0; c < 3; c++) Assert.Equal(viaGlobal[o + c], viaMask[o + c]);
+    }
+
+    /// <summary>
+    /// A local grain offset rides on top of global grain rather than replacing it:
+    /// where the mask sits, the amplitude is the global amount plus the mask's, so
+    /// the interior differs from a globally-grained render while the exterior — same
+    /// global grain either way — stays identical.
+    /// </summary>
+    [Fact]
+    public void LocalGrain_AddsToGlobalGrain()
+    {
+        var raw = MakeRaw();
+        var globalGrain = new DevelopSettings { GrainAmount = 30 };
+        var boosted = globalGrain.Clone();
+        boosted.Masks.Add(CenteredMask(0.2, new MaskAdjustments { Grain = 60 }));
+
+        byte[] a = RenderBytes(raw, globalGrain);
+        byte[] b = RenderBytes(raw, boosted);
+
+        // Same global grain outside the mask → identical.
+        foreach (var (x, y) in new[] { (0, 0), (W - 1, H - 1) })
+        {
+            int o = Offset(x, y);
+            for (int c = 0; c < 3; c++) Assert.Equal(a[o + c], b[o + c]);
+        }
+
+        int changed = 0;
+        for (int dy = -25; dy <= 25; dy++)
+            for (int dx = -25; dx <= 25; dx++)
+            {
+                int o = Offset(W / 2 + dx, H / 2 + dy);
+                if (a[o] != b[o] || a[o + 1] != b[o + 1] || a[o + 2] != b[o + 2]) changed++;
+            }
+        Assert.True(changed > 150, $"local grain did not add to the global field ({changed} px)");
     }
 }

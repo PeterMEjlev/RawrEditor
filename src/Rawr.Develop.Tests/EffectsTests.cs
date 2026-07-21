@@ -93,6 +93,69 @@ public class EffectsTests
         Assert.Equal(b, b2);
     }
 
+    // ── Airlight: cached + plane-free, still bit-identical ──────────────────
+
+    /// <summary>The plane-free sensor estimate must agree with the float-plane
+    /// estimate to the last bit — same dark-channel math, same summation order —
+    /// so nothing downstream of Dehaze moves.</summary>
+    [Fact]
+    public void AirlightFromSensor_MatchesPlaneEstimate_BitExact()
+    {
+        var src = HazySensor();
+        int n = W * H;
+        var r = new float[n]; var g = new float[n]; var b = new float[n];
+        const float inv = 1f / 65535f;
+        for (int i = 0; i < n; i++)
+        {
+            r[i] = src[i * 3] * inv;
+            g[i] = src[i * 3 + 1] * inv;
+            b[i] = src[i * 3 + 2] * inv;
+        }
+
+        var expected = Effects.EstimateAirlight(r, g, b, W, H);
+        var actual = Effects.EstimateAirlightFromSensor(src, W, H);
+
+        Assert.True(actual.IsValid);
+        Assert.Equal(expected.R, actual.R);
+        Assert.Equal(expected.G, actual.G);
+        Assert.Equal(expected.B, actual.B);
+    }
+
+    /// <summary>A second estimate on the same buffer is served from the weak-table
+    /// cache and returns the identical value.</summary>
+    [Fact]
+    public void AirlightFromSensor_CachesPerBuffer()
+    {
+        var src = HazySensor();
+        var first = Effects.EstimateAirlightFromSensor(src, W, H);
+        var second = Effects.EstimateAirlightFromSensor(src, W, H);
+        Assert.Equal(first.R, second.R);
+        Assert.Equal(first.G, second.G);
+        Assert.Equal(first.B, second.B);
+    }
+
+    /// <summary>A hazy interleaved 16-bit sensor frame — the blue-ish haze of
+    /// <see cref="HazyScene"/> quantised to sensor units.</summary>
+    private static ushort[] HazySensor()
+    {
+        var src = new ushort[W * H * 3];
+        const float ar = 0.72f, ag = 0.75f, ab = 0.82f;
+        for (int y = 0; y < H; y++)
+        {
+            for (int x = 0; x < W; x++)
+            {
+                int i = y * W + x;
+                float depth = x / (float)W;
+                float t = 1f - 0.75f * depth;
+                float scene = ((x / 3 + y / 3) % 2 == 0) ? 0.22f : 0.55f;
+                src[i * 3]     = (ushort)((scene * t + ar * (1f - t)) * 65535f);
+                src[i * 3 + 1] = (ushort)((scene * t + ag * (1f - t)) * 65535f);
+                src[i * 3 + 2] = (ushort)((scene * t + ab * (1f - t)) * 65535f);
+            }
+        }
+        return src;
+    }
+
     // ── Texture ────────────────────────────────────────────────────────────
 
     [Fact]
