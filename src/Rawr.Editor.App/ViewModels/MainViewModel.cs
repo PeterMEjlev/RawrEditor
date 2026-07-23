@@ -172,6 +172,13 @@ public sealed partial class MainViewModel : ObservableObject
         if (!HasPhoto) return;
         if (value) _ = ShowBeforeAsync();
         else PreviewImage = _currentRender;
+
+        // The sharp tile carries the edit in After and the neutral frame in Before;
+        // a toggle flips which, so rebuild it under the new state. Without this the
+        // tile would keep the old side's pixels sharp over the new preview. No-op
+        // when the tile isn't live — KickDetailRender self-guards on _detailWanted.
+        KickDetailRender();
+
         StatusText = value
             ? "Showing BEFORE — toggle off to return to your edits."
             : $"{FileName} — edits apply live";
@@ -287,7 +294,9 @@ public sealed partial class MainViewModel : ObservableObject
         var cts = new CancellationTokenSource();
         _detailCts = cts;
 
-        var settings = CurrentSettings();   // current geometry, masks and sliders
+        // In Before the tile must match the neutral preview, not the edit —
+        // otherwise toggling Before would leave the edited pixels sharp on screen.
+        var settings = IsShowingBefore ? NeutralSettings() : CurrentSettings();
         var roi = _detailRoi;
         var scale = _detailScale;
         var ct = cts.Token;
@@ -428,6 +437,20 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private double _grainAmount;
     [ObservableProperty] private double _grainSize = Effects.DefaultGrainSize;
     [ObservableProperty] private double _grainRoughness = Effects.DefaultGrainRoughness;
+
+    // ── Section switches (Lightroom's per-panel on/off) ──────────────────────
+    // Each turns its whole section off in the render without disturbing the
+    // sliders under it: CurrentSettings substitutes that section's defaults while
+    // the switch is off, so the photo shows as if the section were untouched and
+    // flipping it back restores the edit intact. It is the same "keep the settings,
+    // drop them from the render" A/B the per-mask Enabled checkbox gives locally,
+    // one level up. The names are on AdjustmentNames, so a toggle re-renders.
+    [ObservableProperty] private bool _lightEnabled = true;
+    [ObservableProperty] private bool _colorEnabled = true;
+    [ObservableProperty] private bool _colorMixerEnabled = true;
+    [ObservableProperty] private bool _effectsEnabled = true;
+    [ObservableProperty] private bool _sharpeningEnabled = true;
+    [ObservableProperty] private bool _noiseReductionEnabled = true;
 
     // ── Masking mask overlay ────────────────────────────────────────────────
     // Lightroom shows this on Alt-drag; here it is an explicit option, because a
@@ -1223,7 +1246,10 @@ public sealed partial class MainViewModel : ObservableObject
         nameof(LuminanceNoiseReduction), nameof(LuminanceNoiseDetail),
         nameof(LuminanceNoiseContrast), nameof(ColorNoiseReduction),
         nameof(Texture), nameof(Clarity), nameof(Dehaze),
-        nameof(GrainAmount), nameof(GrainSize), nameof(GrainRoughness)
+        nameof(GrainAmount), nameof(GrainSize), nameof(GrainRoughness),
+        // Section on/off switches — a flip re-renders like any slider move.
+        nameof(LightEnabled), nameof(ColorEnabled), nameof(ColorMixerEnabled),
+        nameof(EffectsEnabled), nameof(SharpeningEnabled), nameof(NoiseReductionEnabled)
     };
 
     // Any adjustment change schedules a debounced re-render.
@@ -1234,43 +1260,109 @@ public sealed partial class MainViewModel : ObservableObject
             ScheduleRender();
     }
 
-    private DevelopSettings CurrentSettings() => new()
+    private DevelopSettings CurrentSettings()
     {
-        Temperature = Temperature,
-        UseKelvin = UseKelvin,
-        TemperatureKelvin = TemperatureKelvin,
-        Tint = Tint,
-        Exposure = Exposure,
-        Contrast = Contrast,
-        Highlights = Highlights,
-        Shadows = Shadows,
-        Whites = Whites,
-        Blacks = Blacks,
-        Vibrance = Vibrance,
-        Saturation = Saturation,
-        // Cloned, not handed over: the render runs on a background thread while
-        // the user keeps dragging, and the bands are a mutable array.
-        ColorMixer = _colorMixer.Clone(),
-        Sharpening = Sharpening,
-        SharpenRadius = SharpenRadius,
-        SharpenDetail = SharpenDetail,
-        SharpenMasking = SharpenMasking,
-        LuminanceNoiseReduction = LuminanceNoiseReduction,
-        LuminanceNoiseDetail = LuminanceNoiseDetail,
-        LuminanceNoiseContrast = LuminanceNoiseContrast,
-        ColorNoiseReduction = ColorNoiseReduction,
-        Texture = Texture,
-        Clarity = Clarity,
-        Dehaze = Dehaze,
-        GrainAmount = GrainAmount,
-        GrainSize = GrainSize,
-        GrainRoughness = GrainRoughness,
-        // Cloned for the same reason as the mixer: the render runs off-thread
-        // while the user may still be dragging a mask (or the crop box) across
-        // the photo.
-        Geometry = _geometry.Clone(),
-        Masks = Masks.Select(m => m.Mask.Clone()).ToList(),
-    };
+        var s = new DevelopSettings
+        {
+            Temperature = Temperature,
+            UseKelvin = UseKelvin,
+            TemperatureKelvin = TemperatureKelvin,
+            Tint = Tint,
+            Exposure = Exposure,
+            Contrast = Contrast,
+            Highlights = Highlights,
+            Shadows = Shadows,
+            Whites = Whites,
+            Blacks = Blacks,
+            Vibrance = Vibrance,
+            Saturation = Saturation,
+            // Cloned, not handed over: the render runs on a background thread while
+            // the user keeps dragging, and the bands are a mutable array.
+            ColorMixer = _colorMixer.Clone(),
+            Sharpening = Sharpening,
+            SharpenRadius = SharpenRadius,
+            SharpenDetail = SharpenDetail,
+            SharpenMasking = SharpenMasking,
+            LuminanceNoiseReduction = LuminanceNoiseReduction,
+            LuminanceNoiseDetail = LuminanceNoiseDetail,
+            LuminanceNoiseContrast = LuminanceNoiseContrast,
+            ColorNoiseReduction = ColorNoiseReduction,
+            Texture = Texture,
+            Clarity = Clarity,
+            Dehaze = Dehaze,
+            GrainAmount = GrainAmount,
+            GrainSize = GrainSize,
+            GrainRoughness = GrainRoughness,
+            // Cloned for the same reason as the mixer: the render runs off-thread
+            // while the user may still be dragging a mask (or the crop box) across
+            // the photo.
+            Geometry = _geometry.Clone(),
+            Masks = Masks.Select(m => m.Mask.Clone()).ToList(),
+        };
+
+        ApplySectionSwitches(s);
+        return s;
+    }
+
+    /// <summary>
+    /// Zero out any section whose switch is off, resetting exactly its fields to
+    /// the values a fresh <see cref="DevelopSettings"/> carries — so a disabled
+    /// section renders as untouched while the sliders keep the user's numbers for
+    /// when it comes back on. Masks are left alone: a section switch is the global
+    /// panel's on/off, and a mask's own Light/Colour/Effects offsets are its
+    /// business (they add onto whatever the global resolved to, neutral or not),
+    /// exactly as Lightroom keeps its panel switches and local adjustments apart.
+    /// Colour NR stays at its default rather than 0 when Noise Reduction is off,
+    /// because that default *is* the baseline chroma blur, not an edit.
+    /// </summary>
+    private void ApplySectionSwitches(DevelopSettings s)
+    {
+        if (!LightEnabled)
+        {
+            s.Exposure = 0; s.Contrast = 0;
+            s.Highlights = 0; s.Shadows = 0; s.Whites = 0; s.Blacks = 0;
+        }
+        if (!ColorEnabled)
+        {
+            // Temperature 0 with the relative control resolves to the as-shot
+            // illuminant, so white balance and the presence pair all go neutral.
+            s.Temperature = 0; s.Tint = 0;
+            s.UseKelvin = false; s.TemperatureKelvin = WhiteBalance.AsShotKelvin;
+            s.Vibrance = 0; s.Saturation = 0;
+        }
+        if (!ColorMixerEnabled)
+            s.ColorMixer = new ColorMixerSettings();
+        if (!EffectsEnabled)
+        {
+            s.Texture = 0; s.Clarity = 0; s.Dehaze = 0;
+            s.GrainAmount = 0;
+            s.GrainSize = Effects.DefaultGrainSize;
+            s.GrainRoughness = Effects.DefaultGrainRoughness;
+        }
+        if (!SharpeningEnabled)
+        {
+            s.Sharpening = 0;
+            s.SharpenRadius = Detail.DefaultSharpenRadius;
+            s.SharpenDetail = Detail.DefaultSharpenDetail;
+            s.SharpenMasking = Detail.DefaultSharpenMasking;
+        }
+        if (!NoiseReductionEnabled)
+        {
+            s.LuminanceNoiseReduction = 0;
+            s.LuminanceNoiseDetail = Detail.DefaultLuminanceDetail;
+            s.LuminanceNoiseContrast = Detail.DefaultLuminanceContrast;
+            s.ColorNoiseReduction = Detail.DefaultColorNoiseReduction;
+        }
+    }
+
+    /// <summary>
+    /// The settings the Before view renders under: geometry preserved, every tonal
+    /// and colour control left at default. Backs both the neutral preview and its
+    /// sharp detail tile, so the two show the same unedited frame. The geometry
+    /// matches <see cref="CurrentSettings"/> whenever the tile is live (the crop
+    /// tool is closed), so switching sides reuses the developed 1:1 buffer.
+    /// </summary>
+    private DevelopSettings NeutralSettings() => new() { Geometry = PreviewGeometry() };
 
     /// <summary>
     /// The geometry the <i>viewer</i> renders under, which is not the one the
@@ -1370,10 +1462,23 @@ public sealed partial class MainViewModel : ObservableObject
             catch (OperationCanceledException) { /* superseded by a newer edit */ }
         }, ct);
 
+        if (mask)
+        {
+            // The 1:1 tile is drawn *over* the preview, so leaving it up would
+            // cover the mask with the very photo the mask stands in for — the
+            // overlay would swap in underneath and never be seen. Hide it for the
+            // duration of the drag, and cancel any tile already in flight: one
+            // kicked before the drag would otherwise land mid-preview and switch
+            // the layer back on. Releasing the thumb re-renders and restores it.
+            _detailCts?.Cancel();
+            DetailActive = false;
+            return;
+        }
+
         // Keep the 1:1 tile in step with the edit. It renders in parallel with the
         // preview above (both viewport-bounded, both cancellable) and shows the
         // same settings at native resolution over the visible window.
-        if (_detailWanted && !mask) KickDetailRender();
+        if (_detailWanted) KickDetailRender();
     }
 
     [RelayCommand]
@@ -1501,6 +1606,10 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void ResetAdjustments()
     {
+        // Every section back on — a switch left off is an edit like any slider.
+        LightEnabled = ColorEnabled = ColorMixerEnabled =
+            EffectsEnabled = SharpeningEnabled = NoiseReductionEnabled = true;
+
         Temperature = Tint = Exposure = Contrast = Highlights =
             Shadows = Whites = Blacks = Vibrance = Saturation = 0;
         // Back to the anchor, where white balance is a no-op. The Kelvin/relative

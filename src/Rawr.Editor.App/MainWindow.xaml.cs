@@ -433,7 +433,10 @@ public partial class MainWindow : Window
 
         double absPrev = 0, outToPrev = 0, prevCx = 0, prevCy = 0;
         int fullOutW = 0, fullOutH = 0;
-        bool wanted = !vm.IsCropActive && !vm.IsShowingBefore
+        // Before gets a sharp tile too, rendered from the neutral settings (see
+        // MainViewModel.KickDetailRender); without one it would fall back to the
+        // soft preview while After stayed crisp.
+        bool wanted = !vm.IsCropActive
                       && TryDetailMapping(out absPrev, out outToPrev,
                                           out prevCx, out prevCy,
                                           out fullOutW, out fullOutH);
@@ -556,8 +559,9 @@ public partial class MainWindow : Window
                 break;
 
             case nameof(ViewModels.MainViewModel.IsShowingBefore):
-                // Before hides the tile; returning to After has to bring it back,
-                // and neither toggles the viewer transform on its own.
+                // The tile now shows in both modes (neutral vs edited); re-place it
+                // for the new state. The view-model kicks the actual re-render, since
+                // the toggle changes neither the ROI nor the zoom the throttle keys on.
                 UpdateDetailView();
                 break;
         }

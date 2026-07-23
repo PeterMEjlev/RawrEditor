@@ -64,6 +64,50 @@
         <Setter Property="Margin" Value="0,0,0,10" />
     </Style>
 
+    <!-- Compact on/off switch that sits at the right of a section header —
+         Lightroom's per-panel enable toggle. Off shows a dim knob on a neutral
+         track; On slides it right and fills the track with the accent. -->
+    <Style TargetType="{x:Type ToggleButton}" x:Key="SectionSwitch">
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="Width" Value="30" />
+        <Setter Property="Height" Value="16" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type ToggleButton}">
+                    <!-- Transparent backdrop so the whole 30×16 cell is clickable,
+                         not just the 14 px track inside it. -->
+                    <Grid Background="Transparent">
+                        <Border x:Name="Track"
+                                Height="14"
+                                CornerRadius="7"
+                                Background="{StaticResource BgControlBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1" />
+                        <Ellipse x:Name="Knob"
+                                 Width="10" Height="10"
+                                 HorizontalAlignment="Left"
+                                 Margin="3,0,0,0"
+                                 Fill="{StaticResource TextDimBrush}" />
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="Track" Property="Background" Value="{StaticResource AccentBrush}" />
+                            <Setter TargetName="Track" Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                            <Setter TargetName="Knob" Property="HorizontalAlignment" Value="Right" />
+                            <Setter TargetName="Knob" Property="Margin" Value="0,0,3,0" />
+                            <Setter TargetName="Knob" Property="Fill" Value="White" />
+                        </Trigger>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Track" Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <Style TargetType="{x:Type Border}" x:Key="PanelBorder">
         <Setter Property="Background" Value="{StaticResource BgPanelBrush}" />
         <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
@@ -281,6 +325,11 @@
          fill, which would otherwise paint over the gradient it sits on. -->
     <Style x:Key="AdjustmentSlider" TargetType="{x:Type Slider}">
         <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+        <!-- Click the track to jump the thumb straight to that point. Off (the
+             default) a track click only pages by LargeChange toward the cursor,
+             so clicking -75 from 0 crawls a little into the negative instead of
+             landing on it. -->
+        <Setter Property="IsMoveToPointEnabled" Value="True" />
         <Setter Property="IsSelectionRangeEnabled" Value="True" />
         <Setter Property="Height" Value="18" />
         <Setter Property="Background" Value="{StaticResource BgControlBrush}" />

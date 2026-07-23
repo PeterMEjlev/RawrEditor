@@ -247,7 +247,14 @@
                              the presence pair, since both act on hue/saturation. -->
                         <Border Style="{StaticResource SectionCard}">
                             <StackPanel>
-                                <TextBlock Text="LIGHT" Style="{StaticResource SectionCardHeader}" />
+                                <Grid Margin="0,0,0,10">
+                                    <TextBlock Text="LIGHT" Style="{StaticResource SectionCardHeader}"
+                                               Margin="0" VerticalAlignment="Center" />
+                                    <ToggleButton HorizontalAlignment="Right"
+                                                  Style="{StaticResource SectionSwitch}"
+                                                  IsChecked="{Binding LightEnabled, Mode=TwoWay}"
+                                                  ToolTip="Turn Light off to preview the photo without these edits — the sliders keep their values" />
+                                </Grid>
                                 <!-- Exposure is the one slider that keeps decimals: it is a
                                      physical quantity in stops, and Lightroom's 0.05 step is
                                      finer than one integer stop by design. -->
@@ -263,7 +270,14 @@
 
                         <Border Style="{StaticResource SectionCard}">
                             <StackPanel>
-                                <TextBlock Text="COLOR" Style="{StaticResource SectionCardHeader}" />
+                                <Grid Margin="0,0,0,10">
+                                    <TextBlock Text="COLOR" Style="{StaticResource SectionCardHeader}"
+                                               Margin="0" VerticalAlignment="Center" />
+                                    <ToggleButton HorizontalAlignment="Right"
+                                                  Style="{StaticResource SectionSwitch}"
+                                                  IsChecked="{Binding ColorEnabled, Mode=TwoWay}"
+                                                  ToolTip="Turn Color off to preview without the white balance and presence edits" />
+                                </Grid>
                                 <!-- Temp carries a unit pill: "Δ" for a shift relative to the
                                      camera white balance, "K" for an absolute illuminant. The
                                      range, step and origin all follow the mode. -->
@@ -293,7 +307,14 @@
                              view-model routes them and repaints the tracks. -->
                         <Border Style="{StaticResource SectionCard}">
                             <StackPanel>
-                                <TextBlock Text="COLOR MIXER" Style="{StaticResource SectionCardHeader}" />
+                                <Grid Margin="0,0,0,10">
+                                    <TextBlock Text="COLOR MIXER" Style="{StaticResource SectionCardHeader}"
+                                               Margin="0" VerticalAlignment="Center" />
+                                    <ToggleButton HorizontalAlignment="Right"
+                                                  Style="{StaticResource SectionSwitch}"
+                                                  IsChecked="{Binding ColorMixerEnabled, Mode=TwoWay}"
+                                                  ToolTip="Turn the Color Mixer off to preview without the per-hue edits" />
+                                </Grid>
 
                                 <ListBox Style="{StaticResource ColorBandSelector}"
                                          ItemsSource="{Binding ColorBands}"
@@ -320,7 +341,14 @@
                              laid on at the very end. -->
                         <Border Style="{StaticResource SectionCard}">
                             <StackPanel>
-                                <TextBlock Text="EFFECTS" Style="{StaticResource SectionCardHeader}" />
+                                <Grid Margin="0,0,0,10">
+                                    <TextBlock Text="EFFECTS" Style="{StaticResource SectionCardHeader}"
+                                               Margin="0" VerticalAlignment="Center" />
+                                    <ToggleButton HorizontalAlignment="Right"
+                                                  Style="{StaticResource SectionSwitch}"
+                                                  IsChecked="{Binding EffectsEnabled, Mode=TwoWay}"
+                                                  ToolTip="Turn Effects off to preview without Texture, Clarity, Dehaze and Grain" />
+                                </Grid>
                                 <ctl:AdjustmentRow Label="Texture" Value="{Binding Texture, Mode=TwoWay}"
                                                    ToolTip="Fine detail — negative smooths skin, positive brings out pores and foliage" />
                                 <ctl:AdjustmentRow Label="Clarity" Value="{Binding Clarity, Mode=TwoWay}"
@@ -348,7 +376,14 @@
                              reset target and where the accent fill grows from. -->
                         <Border Style="{StaticResource SectionCard}">
                             <StackPanel>
-                                <TextBlock Text="SHARPENING" Style="{StaticResource SectionCardHeader}" />
+                                <Grid Margin="0,0,0,10">
+                                    <TextBlock Text="SHARPENING" Style="{StaticResource SectionCardHeader}"
+                                               Margin="0" VerticalAlignment="Center" />
+                                    <ToggleButton HorizontalAlignment="Right"
+                                                  Style="{StaticResource SectionSwitch}"
+                                                  IsChecked="{Binding SharpeningEnabled, Mode=TwoWay}"
+                                                  ToolTip="Turn Sharpening off to preview without capture sharpening" />
+                                </Grid>
                                 <ctl:AdjustmentRow Label="Amount" Value="{Binding Sharpening, Mode=TwoWay}"
                                                    Minimum="0" Maximum="150" Origin="0"
                                                    ToolTip="Judge sharpening at 100% — the fit view renders a smaller buffer" />
@@ -372,7 +407,14 @@
 
                         <Border Style="{StaticResource SectionCard}">
                             <StackPanel>
-                                <TextBlock Text="NOISE REDUCTION" Style="{StaticResource SectionCardHeader}" />
+                                <Grid Margin="0,0,0,10">
+                                    <TextBlock Text="NOISE REDUCTION" Style="{StaticResource SectionCardHeader}"
+                                               Margin="0" VerticalAlignment="Center" />
+                                    <ToggleButton HorizontalAlignment="Right"
+                                                  Style="{StaticResource SectionSwitch}"
+                                                  IsChecked="{Binding NoiseReductionEnabled, Mode=TwoWay}"
+                                                  ToolTip="Turn Noise Reduction off to preview without luminance and colour denoise" />
+                                </Grid>
                                 <ctl:AdjustmentRow Label="Luminance" Value="{Binding LuminanceNoiseReduction, Mode=TwoWay}"
                                                    Minimum="0" Maximum="100" Origin="0" />
                                 <ctl:AdjustmentRow Label="Detail" Value="{Binding LuminanceNoiseDetail, Mode=TwoWay}"
