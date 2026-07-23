@@ -29,6 +29,7 @@ public sealed partial class MaskItem : ObservableObject
     private RadialMask Radial => Mask.Radial;
     private LinearGradientMask Linear => Mask.Linear;
     private RectangleMask Rectangle => Mask.Rectangle;
+    private BrushMask Brush => Mask.Brush;
     private MaskAdjustments Adjustments => Mask.Adjustments;
 
     /// <summary>Which shape rows the panel should show. Fixed for a mask's
@@ -37,13 +38,22 @@ public sealed partial class MaskItem : ObservableObject
     public bool IsRadial => Mask.IsRadial;
     public bool IsLinear => Mask.IsLinear;
     public bool IsRectangle => Mask.IsRectangle;
+    public bool IsBrush => Mask.IsBrush;
 
     /// <summary>Whether the Feather row applies — the closed shapes (radial and
-    /// rectangle) carry one; a linear ramp's own width <i>is</i> its feather.</summary>
+    /// rectangle) carry one; a linear ramp's own width <i>is</i> its feather, and
+    /// a brush's edge is fixed per stroke (see <see cref="BrushMask.CoreFraction"/>).</summary>
     public bool HasFeather => Mask.IsRadial || Mask.IsRectangle;
 
     /// <summary>Raised whenever an edit here should cause a re-render.</summary>
     public event EventHandler? Changed;
+
+    /// <summary>Raised when an edit here changes what the on-canvas overlay draws
+    /// but cannot change the render — the brush's Size and Opacity, which arm the
+    /// next stroke rather than touching the ones already painted. Kept apart from
+    /// <see cref="Changed"/> so dragging the Size slider redraws the cursor ring
+    /// without queueing a pipeline pass per mouse move.</summary>
+    public event EventHandler? VisualsOnlyChanged;
 
     /// <summary>Raised only when one of the <i>adjustment</i> sliders (Light,
     /// Color, Effects) moves — not when the shape is reshaped. The panel uses it
@@ -64,6 +74,13 @@ public sealed partial class MaskItem : ObservableObject
         OnPropertyChanged(propertyName);
         Changed?.Invoke(this, EventArgs.Empty);
         AdjustmentChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void EditTool(Action apply, string propertyName)
+    {
+        apply();
+        OnPropertyChanged(propertyName);
+        VisualsOnlyChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public string Name
@@ -122,14 +139,15 @@ public sealed partial class MaskItem : ObservableObject
         set { if (Linear.Angle != value) Edit(() => Linear.Angle = value, nameof(Angle)); }
     }
 
-    /// <summary>Routes to whichever shape this mask is — both kinds have an
-    /// Invert, and the panel binds one row for it.</summary>
+    /// <summary>Routes to whichever shape this mask is — every kind has an Invert,
+    /// and the panel binds one row for it.</summary>
     public bool Invert
     {
         get => Mask.Kind switch
         {
             MaskKind.Linear => Linear.Invert,
             MaskKind.Rectangle => Rectangle.Invert,
+            MaskKind.Brush => Brush.Invert,
             _ => Radial.Invert,
         };
         set
@@ -139,8 +157,39 @@ public sealed partial class MaskItem : ObservableObject
             {
                 if (Mask.IsLinear) Linear.Invert = value;
                 else if (Mask.IsRectangle) Rectangle.Invert = value;
+                else if (Mask.IsBrush) Brush.Invert = value;
                 else Radial.Invert = value;
             }, nameof(Invert));
+        }
+    }
+
+    // ── Brush tool ──────────────────────────────────────────────────────────
+    // Both arm the *next* stroke; neither can alter one already painted, which is
+    // why they go through EditTool and never wake the renderer.
+
+    /// <summary>Brush radius as a percentage of the image width — the same unit the
+    /// linear gradient's Width row uses, so the two read on the same scale.</summary>
+    public double BrushSize
+    {
+        get => Brush.Size * 100.0;
+        set
+        {
+            double v = Math.Clamp(value / 100.0, BrushMask.MinSize, BrushMask.MaxSize);
+            if (Brush.Size == v) return;
+            EditTool(() => Brush.Size = v, nameof(BrushSize));
+        }
+    }
+
+    /// <summary>How strongly one stroke paints, 0…100. Below 100 strokes build up
+    /// where they overlap, which is how you feather a selection by hand.</summary>
+    public double BrushOpacity
+    {
+        get => Brush.Opacity * 100.0;
+        set
+        {
+            double v = Math.Clamp(value / 100.0, 0.0, 1.0);
+            if (Brush.Opacity == v) return;
+            EditTool(() => Brush.Opacity = v, nameof(BrushOpacity));
         }
     }
 

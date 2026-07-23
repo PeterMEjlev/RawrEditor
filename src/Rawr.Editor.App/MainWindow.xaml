@@ -134,6 +134,8 @@
                       MouseWheel="OnViewerMouseWheel"
                       MouseLeftButtonDown="OnViewerMouseLeftButtonDown"
                       MouseLeftButtonUp="OnViewerMouseLeftButtonUp"
+                      MouseDown="OnViewerMouseDown"
+                      MouseUp="OnViewerMouseUp"
                       MouseMove="OnViewerMouseMove"
                       SizeChanged="OnViewerSizeChanged">
                     <Image x:Name="ViewerImage"
@@ -545,30 +547,31 @@
                                 <Border Style="{StaticResource SectionCard}">
                                     <StackPanel>
 
-                                        <Grid Margin="0,0,0,8">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="*" />
-                                                <ColumnDefinition Width="6" />
-                                                <ColumnDefinition Width="*" />
-                                                <ColumnDefinition Width="6" />
-                                                <ColumnDefinition Width="*" />
-                                            </Grid.ColumnDefinitions>
-                                            <Button Grid.Column="0"
-                                                    Content="＋  Radial"
+                                        <!-- Two rows of two rather than one row of
+                                             four: at this panel width four buttons
+                                             would trim their own captions. -->
+                                        <UniformGrid Rows="2" Columns="2" Margin="0,0,0,8">
+                                            <Button Content="＋  Radial"
+                                                    Margin="0,0,3,3"
                                                     Command="{Binding BeginRadialMaskCommand}"
                                                     IsEnabled="{Binding HasPhoto}"
                                                     ToolTip="Then drag on the photo, from the centre outward" />
-                                            <Button Grid.Column="2"
-                                                    Content="＋  Linear"
+                                            <Button Content="＋  Linear"
+                                                    Margin="3,0,0,3"
                                                     Command="{Binding BeginLinearMaskCommand}"
                                                     IsEnabled="{Binding HasPhoto}"
                                                     ToolTip="Then drag from the full-strength edge toward where the effect should fade out" />
-                                            <Button Grid.Column="4"
-                                                    Content="＋  Rectangle"
+                                            <Button Content="＋  Rectangle"
+                                                    Margin="0,3,3,0"
                                                     Command="{Binding BeginRectangleMaskCommand}"
                                                     IsEnabled="{Binding HasPhoto}"
                                                     ToolTip="Then drag on the photo to draw a rectangle, from its centre outward" />
-                                        </Grid>
+                                            <Button Content="＋  Brush"
+                                                    Margin="3,3,0,0"
+                                                    Command="{Binding BeginBrushMaskCommand}"
+                                                    IsEnabled="{Binding HasPhoto}"
+                                                    ToolTip="Then paint on the photo. Hold Alt to erase; middle-drag pans" />
+                                        </UniformGrid>
 
                                         <TextBlock Text="No masks yet — add one, then drag on the photo."
                                                    Foreground="{StaticResource TextDimBrush}"
@@ -626,8 +629,9 @@
                                             <!-- Shape rows differ by kind: the closed shapes
                                                  (radial, rectangle) have a feather inside their
                                                  outline, a linear ramp's own length *is* its
-                                                 feather. Invert is common to all and routes in
-                                                 the item. -->
+                                                 feather, and a brush has neither — it has the
+                                                 tool that paints it. Invert is common to all and
+                                                 routes in the item. -->
                                             <ctl:AdjustmentRow Label="Feather"
                                                                Value="{Binding SelectedMask.Feather, Mode=TwoWay}"
                                                                Minimum="0" Maximum="100" Origin="0"
@@ -644,6 +648,27 @@
                                                                    Value="{Binding SelectedMask.Angle, Mode=TwoWay}"
                                                                    Minimum="-180" Maximum="180" Origin="90"
                                                                    ToolTip="Direction the effect fades along. 90° fades downward" />
+                                            </StackPanel>
+
+                                            <!-- Brush. Both rows arm the *next* stroke rather
+                                                 than changing what is already painted, which is
+                                                 why neither costs a re-render — see
+                                                 MaskItem.BrushSize. -->
+                                            <StackPanel Visibility="{Binding SelectedMask.IsBrush,
+                                                            Converter={StaticResource BoolVis}}">
+                                                <ctl:AdjustmentRow Label="Size"
+                                                                   Value="{Binding SelectedMask.BrushSize, Mode=TwoWay}"
+                                                                   Minimum="0.2" Maximum="50" Origin="6"
+                                                                   Step="0.1" Decimals="1"
+                                                                   ToolTip="Brush radius, as a percentage of the image width. Applies to the next stroke" />
+                                                <ctl:AdjustmentRow Label="Opacity"
+                                                                   Value="{Binding SelectedMask.BrushOpacity, Mode=TwoWay}"
+                                                                   Minimum="0" Maximum="100" Origin="100"
+                                                                   ToolTip="How strongly one stroke paints. Below 100 strokes build up where they overlap. Applies to the next stroke" />
+                                                <TextBlock Text="Drag on the photo to paint. Hold Alt to erase; middle-drag pans."
+                                                           Foreground="{StaticResource TextDimBrush}"
+                                                           TextWrapping="Wrap"
+                                                           Margin="0,2,0,4" />
                                             </StackPanel>
 
                                             <CheckBox Content="Invert"

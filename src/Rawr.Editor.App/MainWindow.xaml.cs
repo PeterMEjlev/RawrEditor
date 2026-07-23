@@ -258,8 +258,35 @@ public partial class MainWindow : Window
             return;
         }
 
+        BeginPan(e.GetPosition(ViewerHost));
+    }
+
+    /// <summary>
+    /// Middle-drag pans too.
+    ///
+    /// <para>Normally the left button is enough — presses the overlays do not want
+    /// fall through to here. A selected brush mask is the exception: a paint tool
+    /// has to claim every left press on the canvas, which would otherwise leave a
+    /// zoomed-in photo with no way to move under the brush. The middle button is
+    /// the one no tool takes.</para>
+    /// </summary>
+    private void OnViewerMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.Middle || ViewerImage.Source is null) return;
+        BeginPan(e.GetPosition(ViewerHost));
+        e.Handled = true;
+    }
+
+    private void OnViewerMouseUp(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.Middle) return;
+        EndPan();
+    }
+
+    private void BeginPan(Point origin)
+    {
         _isPanning = true;
-        _panOrigin = e.GetPosition(ViewerHost);
+        _panOrigin = origin;
         _txAtPanStart = _tx;
         _tyAtPanStart = _ty;
         ViewerHost.CaptureMouse();
@@ -275,7 +302,9 @@ public partial class MainWindow : Window
         ApplyTransform();
     }
 
-    private void OnViewerMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    private void OnViewerMouseLeftButtonUp(object sender, MouseButtonEventArgs e) => EndPan();
+
+    private void EndPan()
     {
         if (!_isPanning) return;
         _isPanning = false;

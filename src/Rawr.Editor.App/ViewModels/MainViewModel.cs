@@ -1051,6 +1051,15 @@ public sealed partial class MainViewModel : ObservableObject
         StatusText = "Drag on the photo to draw a rectangle, from its centre outward.";
     }
 
+    [RelayCommand]
+    private void BeginBrushMask()
+    {
+        if (!HasPhoto) return;
+        _pendingMaskKind = MaskKind.Brush;
+        IsCreatingMask = true;
+        StatusText = "Paint on the photo to select an area. Hold Alt to erase; middle-drag pans.";
+    }
+
     /// <summary>
     /// Called by the overlay at the start of a create drag, with the press point
     /// in normalised image coordinates. Must add the mask and select it before
@@ -1058,7 +1067,8 @@ public sealed partial class MainViewModel : ObservableObject
     ///
     /// <para>The kinds read the press point differently: a radial or rectangle
     /// treats it as the centre and grows outward, a linear treats it as the
-    /// full-strength end and ramps away from it.</para>
+    /// full-strength end and ramps away from it, and a brush ignores it — the
+    /// overlay lays the first dab there itself, as the first point of a stroke.</para>
     /// </summary>
     public void CreateMaskAt(double x, double y)
     {
@@ -1091,6 +1101,15 @@ public sealed partial class MainViewModel : ObservableObject
                     Feather = 50,
                 },
             },
+            MaskKind.Brush => new MaskSettings
+            {
+                Name = NextMaskName("Brush"),
+                Kind = MaskKind.Brush,
+                // No strokes: the mask exists so the overlay has somewhere to put
+                // the one the same gesture is about to paint. Until it does, the
+                // mask is blank and the renderer skips it — see MaskSettings.IsInert.
+                Brush = new BrushMask(),
+            },
             _ => new MaskSettings
             {
                 Name = NextMaskName("Radial"),
@@ -1115,6 +1134,7 @@ public sealed partial class MainViewModel : ObservableObject
         var item = new MaskItem(mask);
         item.Changed += OnMaskChanged;
         item.AdjustmentChanged += OnMaskAdjustmentChanged;
+        item.VisualsOnlyChanged += OnMaskVisualsOnlyChanged;
         Masks.Add(item);
         SelectedMask = item;
 
@@ -1129,11 +1149,20 @@ public sealed partial class MainViewModel : ObservableObject
 
     /// <summary>The user moved an adjustment slider on a mask — they are past
     /// placing it, so drop the red overlay and leave it off. Reshaping the mask
-    /// does not come through here, so dragging a handle keeps the overlay up.</summary>
+    /// does not come through here, so dragging a handle keeps the overlay up.
+    ///
+    /// <para>A brush is exempt: its outline <i>is</i> the overlay, so dropping the
+    /// tint after the first slider would leave the user with no way to see what
+    /// they had painted or where the next stroke would go.</para></summary>
     private void OnMaskAdjustmentChanged(object? sender, EventArgs e)
     {
-        if (ShowMaskOverlay) ShowMaskOverlay = false;
+        if (ShowMaskOverlay && sender is MaskItem { IsBrush: false }) ShowMaskOverlay = false;
     }
+
+    /// <summary>A brush's Size or Opacity moved. Those arm the next stroke and
+    /// cannot change a pixel of the current render, so this repaints the cursor
+    /// ring and deliberately does <i>not</i> schedule one.</summary>
+    private void OnMaskVisualsOnlyChanged(object? sender, EventArgs e) => RaiseMaskVisualsChanged();
 
     private void OnMaskChanged(object? sender, EventArgs e)
     {
@@ -1162,6 +1191,7 @@ public sealed partial class MainViewModel : ObservableObject
 
         item.Changed -= OnMaskChanged;
         item.AdjustmentChanged -= OnMaskAdjustmentChanged;
+        item.VisualsOnlyChanged -= OnMaskVisualsOnlyChanged;
         int index = Masks.IndexOf(item);
         Masks.Remove(item);
         SelectedMask = Masks.Count == 0
@@ -1194,6 +1224,15 @@ public sealed partial class MainViewModel : ObservableObject
                 copy.Rectangle.CenterX = Math.Clamp(copy.Rectangle.CenterX + 0.04, 0.0, 1.0);
                 copy.Rectangle.CenterY = Math.Clamp(copy.Rectangle.CenterY + 0.04, 0.0, 1.0);
                 break;
+            case MaskKind.Brush:
+                // A brush has no centre to nudge, so every point of every stroke
+                // moves instead — the copy is the same painting, shifted.
+                foreach (var stroke in copy.Brush.Strokes)
+                    for (int i = 0; i < stroke.Points.Count; i++)
+                        stroke.Points[i] = new BrushPoint(
+                            Math.Clamp(stroke.Points[i].X + 0.04, 0.0, 1.0),
+                            Math.Clamp(stroke.Points[i].Y + 0.04, 0.0, 1.0));
+                break;
             default:
                 copy.Radial.CenterX = Math.Clamp(copy.Radial.CenterX + 0.04, 0.0, 1.0);
                 copy.Radial.CenterY = Math.Clamp(copy.Radial.CenterY + 0.04, 0.0, 1.0);
@@ -1217,6 +1256,7 @@ public sealed partial class MainViewModel : ObservableObject
     {
         MaskKind.Linear => "Linear",
         MaskKind.Rectangle => "Rectangle",
+        MaskKind.Brush => "Brush",
         _ => "Radial",
     };
 
@@ -1226,6 +1266,7 @@ public sealed partial class MainViewModel : ObservableObject
         {
             item.Changed -= OnMaskChanged;
             item.AdjustmentChanged -= OnMaskAdjustmentChanged;
+            item.VisualsOnlyChanged -= OnMaskVisualsOnlyChanged;
         }
         Masks.Clear();
         SelectedMask = null;

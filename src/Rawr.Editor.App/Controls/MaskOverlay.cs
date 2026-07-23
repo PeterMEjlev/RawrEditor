@@ -11,7 +11,8 @@ namespace Rawr.Editor.App.Controls;
 /// The on-canvas editor for masks: draws each mask's shape over the photo and
 /// handles the drags that create, move, resize and rotate it. Radial gradients
 /// draw as an ellipse with grab handles; linear gradients as the three parallel
-/// lines of their ramp.
+/// lines of their ramp; a brush has no outline at all — a cursor ring shows where
+/// the next dab lands and the red tint shows what has been painted.
 ///
 /// <para><b>It draws in screen space, not image space.</b> The obvious
 /// implementation — put the shape in image coordinates and let it inherit the
@@ -40,6 +41,12 @@ public sealed class MaskOverlay : FrameworkElement
     private const double LinearRotateOffset = 58.0;
     private const double MinRadiusPx = 6.0;
     private const double MinLengthPx = 4.0;
+
+    /// <summary>How far the cursor must travel, as a fraction of the brush radius,
+    /// before another point joins the stroke. The spine is rendered as a distance
+    /// field rather than as stamped dabs, so this only trades stored points against
+    /// how faithfully a tight curve is followed — it cannot bead the stroke.</summary>
+    private const double StrokeSpacing = 0.15;
 
     /// <summary>Downsampled width of the red mask-tint bitmap. The tint is a soft
     /// falloff with no fine structure, so rasterising it at preview resolution
@@ -91,10 +98,22 @@ public sealed class MaskOverlay : FrameworkElement
         TopLeft, TopRight, BottomLeft, BottomRight,
         // Linear: the full-effect line, the zero-effect line, and its rotator.
         LinearFull, LinearZero, LinearRotate,
+        // Brush: the drag is a stroke rather than a change to any handle.
+        Paint,
     }
 
     private Grip _grip = Grip.None;
     private MaskSettings? _dragMask;
+
+    /// <summary>The stroke being laid down, or null when not painting. Held rather
+    /// than looked up so a mouse move appends to the stroke this gesture started
+    /// even if the selection changes underneath it.</summary>
+    private BrushStroke? _stroke;
+
+    /// <summary>Where the pointer is, for the brush cursor ring. Only meaningful
+    /// while <see cref="_cursorInside"/>.</summary>
+    private Point _cursor;
+    private bool _cursorInside;
 
     /// <summary>Whether the drag in progress is the one that created the mask.
     /// Tracked here rather than read from <see cref="IsCreating"/> during the
@@ -265,11 +284,17 @@ public sealed class MaskOverlay : FrameworkElement
 
         var selected = SelectedMask;
 
-        if (ShowTint && selected is not null) DrawTint(dc, selected);
+        // A stroke in progress always shows its tint, whatever the checkbox says:
+        // a brush is the one mask you cannot place by watching an outline, so
+        // painting with the overlay off would be painting blind.
+        if (selected is not null && (ShowTint || _grip == Grip.Paint)) DrawTint(dc, selected);
 
         foreach (var mask in Masks)
         {
             if (!mask.IsEnabled || ReferenceEquals(mask, selected)) continue;
+            // A brush has no outline to draw — its shape *is* the tint, which only
+            // the selected mask shows.
+            if (mask.IsBrush) continue;
             if (mask.IsLinear) DrawLinear(dc, mask.Linear, selectedShape: false);
             else if (mask.IsRectangle) DrawRectangleOutline(dc, mask.Rectangle, UnselectedPen, null);
             else DrawRadialOutline(dc, mask.Radial, UnselectedPen, null);
@@ -277,10 +302,36 @@ public sealed class MaskOverlay : FrameworkElement
 
         if (selected is not null && selected.IsEnabled)
         {
-            if (selected.IsLinear) DrawLinear(dc, selected.Linear, selectedShape: true);
+            if (selected.IsBrush) DrawBrushCursor(dc, selected.Brush);
+            else if (selected.IsLinear) DrawLinear(dc, selected.Linear, selectedShape: true);
             else if (selected.IsRectangle) DrawRectangleSelected(dc, selected.Rectangle);
             else DrawRadialSelected(dc, selected.Radial);
         }
+    }
+
+    /// <summary>
+    /// The brush's footprint under the pointer: an outer ring at the radius the
+    /// next stroke will reach, and a dashed inner ring where its falloff begins —
+    /// the same pairing the radial uses for its feather, and the only way to judge
+    /// a brush size before committing a stroke to the photo.
+    ///
+    /// <para>Drawn from the live stroke's own size while one is in progress, so
+    /// nudging the Size slider mid-drag does not resize the ring under a stroke it
+    /// cannot affect.</para>
+    /// </summary>
+    private void DrawBrushCursor(DrawingContext dc, BrushMask brush)
+    {
+        if (!_cursorInside) return;
+
+        double size = _stroke?.Size ?? brush.Size;
+        double r = Math.Clamp(size, BrushMask.MinSize, BrushMask.MaxSize) * ImageWidth * ViewScale;
+        if (r <= 0.5) return;
+
+        dc.DrawEllipse(null, OutlineShadowPen, _cursor, r, r);
+        dc.DrawEllipse(null, OutlinePen, _cursor, r, r);
+
+        double core = r * BrushMask.CoreFraction;
+        if (core > 2.0) dc.DrawEllipse(null, FeatherPen, _cursor, core, core);
     }
 
     private void DrawRadialOutline(DrawingContext dc, RadialMask m, Pen pen, Pen? shadow)
@@ -461,7 +512,8 @@ public sealed class MaskOverlay : FrameworkElement
         string key = string.Create(System.Globalization.CultureInfo.InvariantCulture,
             $"{mask.Kind}|{r.CenterX:F5},{r.CenterY:F5},{r.RadiusX:F5},{r.RadiusY:F5},{r.Rotation:F3},{r.Feather:F2},{r.Invert}|" +
             $"{l.CenterX:F5},{l.CenterY:F5},{l.Angle:F3},{l.Length:F5},{l.Invert}|" +
-            $"{q.CenterX:F5},{q.CenterY:F5},{q.HalfWidth:F5},{q.HalfHeight:F5},{q.Rotation:F3},{q.Feather:F2},{q.Invert}|{ImageWidth}x{ImageHeight}");
+            $"{q.CenterX:F5},{q.CenterY:F5},{q.HalfWidth:F5},{q.HalfHeight:F5},{q.Rotation:F3},{q.Feather:F2},{q.Invert}|" +
+            $"{BrushKey(mask.Brush)}|{ImageWidth}x{ImageHeight}");
         if (_tint is not null && ReferenceEquals(_tintFor, mask) && _tintKey == key) return _tint;
 
         int w = Math.Min(TintWidth, Math.Max(1, ImageWidth));
@@ -494,6 +546,27 @@ public sealed class MaskOverlay : FrameworkElement
         return bmp;
     }
 
+    /// <summary>
+    /// A cheap fingerprint of the painted strokes for the tint cache.
+    ///
+    /// <para>Stroke and point counts plus the newest point is enough because
+    /// strokes are only ever <i>appended</i> to — every edit the overlay makes
+    /// either adds a point to the live stroke or starts a new one, so any of those
+    /// moves one of these three numbers. Hashing every point instead would cost
+    /// more per mouse move than re-rasterising the 360 px tint it is guarding.</para>
+    /// </summary>
+    private static string BrushKey(BrushMask brush)
+    {
+        int points = 0;
+        foreach (var stroke in brush.Strokes) points += stroke.Points.Count;
+
+        var last = brush.Strokes.Count > 0 ? brush.Strokes[^1] : null;
+        var tip = last is { Points.Count: > 0 } ? last.Points[^1] : default;
+
+        return string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"{brush.Strokes.Count},{points},{tip.X:F5},{tip.Y:F5},{brush.Invert}");
+    }
+
     // ── Hit testing ────────────────────────────────────────────────────────
 
     private Grip HitTest(MaskSettings mask, Point screen, bool includeHandles)
@@ -501,6 +574,11 @@ public sealed class MaskOverlay : FrameworkElement
         {
             MaskKind.Linear => HitTestLinear(mask.Linear, screen, includeHandles),
             MaskKind.Rectangle => HitTestRectangle(mask.Rectangle, screen, includeHandles),
+            // A brush has no grips: there is nothing to move, resize or rotate, and
+            // a press on it is a stroke — which OnMouseLeftButtonDown decides
+            // before it ever gets here. Never claiming a press also keeps a painted
+            // mask from swallowing clicks meant for a shape lying underneath it.
+            MaskKind.Brush => Grip.None,
             _ => HitTestRadial(mask.Radial, screen, includeHandles),
         };
 
@@ -619,6 +697,18 @@ public sealed class MaskOverlay : FrameworkElement
 
         var screen = e.GetPosition(this);
 
+        // A selected brush owns the canvas. Once a paint tool is up every press is
+        // a stroke — the alternative, letting a press near another mask's outline
+        // select it instead, means the brush drops strokes at exactly the moment
+        // the user is painting over an existing adjustment. Other masks are still
+        // reachable from the list, and the middle button still pans.
+        if (!IsCreating && SelectedMask is { IsEnabled: true, IsBrush: true } brushMask)
+        {
+            BeginStroke(brushMask, screen, Keyboard.Modifiers.HasFlag(ModifierKeys.Alt));
+            e.Handled = true;
+            return;
+        }
+
         // The selected mask gets first refusal, including its handles — otherwise
         // an overlapping mask drawn later would steal its grips.
         var selected = SelectedMask;
@@ -656,17 +746,81 @@ public sealed class MaskOverlay : FrameworkElement
 
             // The handler is contracted to have set SelectedMask by now, and the
             // same gesture continues as a resize so one drag both places and
-            // shapes the mask. Which grip that is depends on the kind it added.
+            // shapes the mask. Which grip that is depends on the kind it added —
+            // for a brush there is no geometry to rubber-band, so the gesture goes
+            // straight on as the mask's first stroke.
             if (SelectedMask is { } created)
             {
-                BeginDrag(created, created.IsLinear ? Grip.LinearZero : Grip.Right, screen);
-                _creatingDrag = true;
+                if (created.IsBrush)
+                {
+                    BeginStroke(created, screen, Keyboard.Modifiers.HasFlag(ModifierKeys.Alt));
+                }
+                else
+                {
+                    BeginDrag(created, created.IsLinear ? Grip.LinearZero : Grip.Right, screen);
+                    _creatingDrag = true;
+                }
                 e.Handled = true;
             }
             return;
         }
 
         // Nothing here — leave the event unhandled so the viewer pans.
+    }
+
+    /// <summary>
+    /// Start a stroke on a brush mask, snapshotting the tool's current Size and
+    /// Opacity into it — from here on this stroke is fixed, whatever the sliders
+    /// do next.
+    ///
+    /// <para>The first point goes down immediately rather than on the first move,
+    /// so a click without a drag paints a single dab. <paramref name="erase"/> (Alt
+    /// held) makes the stroke subtract instead of add, which is the only way to
+    /// take back a slip short of deleting the whole mask.</para>
+    /// </summary>
+    private void BeginStroke(MaskSettings mask, Point screen, bool erase)
+    {
+        var brush = mask.Brush;
+        var image = ScreenToImage(screen);
+
+        var stroke = new BrushStroke
+        {
+            Size = Math.Clamp(brush.Size, BrushMask.MinSize, BrushMask.MaxSize),
+            Opacity = Math.Clamp(brush.Opacity, 0.0, 1.0),
+            Erase = erase,
+        };
+        stroke.Points.Add(new BrushPoint(image.X / ImageWidth, image.Y / ImageHeight));
+        brush.Strokes.Add(stroke);
+
+        _dragMask = mask;
+        _stroke = stroke;
+        _grip = Grip.Paint;
+        _cursor = screen;
+        _cursorInside = true;
+
+        CaptureMouse();
+        InvalidateVisual();
+        GeometryChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Extend the live stroke, dropping samples that have barely moved. The spine
+    /// is rasterised as a distance field, so thinning it costs fidelity on tight
+    /// curves and nothing else — there is no dab spacing here to bead.
+    /// </summary>
+    private void AppendStrokePoint(Point image)
+    {
+        if (_stroke is null) return;
+
+        double radiusPx = Math.Clamp(_stroke.Size, BrushMask.MinSize, BrushMask.MaxSize) * ImageWidth;
+        double minStep = Math.Max(0.75, radiusPx * StrokeSpacing);
+
+        var last = _stroke.Points[^1];
+        double dx = image.X - last.X * ImageWidth;
+        double dy = image.Y - last.Y * ImageHeight;
+        if (dx * dx + dy * dy < minStep * minStep) return;
+
+        _stroke.Points.Add(new BrushPoint(image.X / ImageWidth, image.Y / ImageHeight));
     }
 
     private void BeginDrag(MaskSettings mask, Grip grip, Point screen)
@@ -724,21 +878,41 @@ public sealed class MaskOverlay : FrameworkElement
         if (!IsActive || !HasImage) return;
 
         var screen = e.GetPosition(this);
+        _cursor = screen;
+        _cursorInside = true;
 
         if (_grip == Grip.None || _dragMask is null)
         {
             UpdateCursor(screen);
+            // The brush ring has to follow the pointer to be of any use. Only for
+            // a brush: every other mask draws nothing that depends on where the
+            // cursor is, and repainting them on every move would be pure waste.
+            if (BrushSelected) InvalidateVisual();
             return;
         }
 
         var image = ScreenToImage(screen);
-        if (_dragMask.IsLinear) DragLinear(_dragMask.Linear, image);
+        if (_grip == Grip.Paint) AppendStrokePoint(image);
+        else if (_dragMask.IsLinear) DragLinear(_dragMask.Linear, image);
         else if (_dragMask.IsRectangle) DragRectangle(_dragMask.Rectangle, image);
         else DragRadial(_dragMask.Radial, image);
 
         InvalidateVisual();
         GeometryChanged?.Invoke(this, EventArgs.Empty);
         e.Handled = true;
+    }
+
+    /// <summary>Whether the brush tool is what a press on the canvas would use.</summary>
+    private bool BrushSelected => IsActive && SelectedMask is { IsEnabled: true, IsBrush: true };
+
+    protected override void OnMouseLeave(MouseEventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (!_cursorInside) return;
+        // Drop the ring when the pointer leaves, or it hangs at the edge of the
+        // canvas suggesting a dab that would never land there.
+        _cursorInside = false;
+        if (BrushSelected) InvalidateVisual();
     }
 
     private void DragRadial(RadialMask m, Point image)
@@ -953,8 +1127,10 @@ public sealed class MaskOverlay : FrameworkElement
 
         _grip = Grip.None;
         _dragMask = null;
+        _stroke = null;
         _creatingDrag = false;
         ReleaseMouseCapture();
+        InvalidateVisual();
         GeometryChanged?.Invoke(this, EventArgs.Empty);
         e.Handled = true;
     }
@@ -965,6 +1141,15 @@ public sealed class MaskOverlay : FrameworkElement
         if (selected is null || !selected.IsEnabled || !IsActive)
         {
             Cursor = IsCreating ? Cursors.Cross : Cursors.Arrow;
+            return;
+        }
+
+        // The ring already says how big the brush is and where it will land; the
+        // crosshair adds the exact centre without hiding the photo the way an
+        // arrow pointer would.
+        if (selected.IsBrush)
+        {
+            Cursor = Cursors.Cross;
             return;
         }
 

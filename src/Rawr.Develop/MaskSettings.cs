@@ -131,6 +131,7 @@ public enum MaskKind
     Radial,
     Linear,
     Rectangle,
+    Brush,
 }
 
 /// <summary>
@@ -144,7 +145,8 @@ public enum MaskKind
 /// <c>SelectedMask.Linear.Length</c> without a cast. What the renderer sees is
 /// narrower than either: <see cref="Bounds"/> and <see cref="Weights"/>, which is
 /// the whole contract a shape has to satisfy — a rectangle and a weight buffer.
-/// A brush or a colour-range mask would slot in the same way.</para>
+/// <see cref="BrushMask"/> slotted in exactly that way, and a colour-range mask
+/// would too.</para>
 /// </summary>
 public sealed class MaskSettings
 {
@@ -162,22 +164,27 @@ public sealed class MaskSettings
 
     public RectangleMask Rectangle { get; set; } = new();
 
+    public BrushMask Brush { get; set; } = new();
+
     public MaskAdjustments Adjustments { get; set; } = new();
 
     public bool IsRadial => Kind == MaskKind.Radial;
     public bool IsLinear => Kind == MaskKind.Linear;
     public bool IsRectangle => Kind == MaskKind.Rectangle;
+    public bool IsBrush => Kind == MaskKind.Brush;
 
-    /// <summary>True when this mask cannot change the render: switched off, or
-    /// every adjustment at zero. The renderer skips these outright, so an empty
-    /// mask the user has added but not yet dialled in costs nothing.</summary>
-    public bool IsInert => !IsEnabled || Adjustments.IsNeutral;
+    /// <summary>True when this mask cannot change the render: switched off, every
+    /// adjustment at zero, or — for a brush — nothing painted yet. The renderer
+    /// skips these outright, so a mask the user has added but not yet dialled in
+    /// (or not yet painted with) costs nothing.</summary>
+    public bool IsInert => !IsEnabled || Adjustments.IsNeutral || (IsBrush && Brush.IsBlank);
 
     /// <summary>The rectangle outside which this mask is exactly zero.</summary>
     public PixelRect Bounds(int imageWidth, int imageHeight) => Kind switch
     {
         MaskKind.Linear => Linear.Bounds(imageWidth, imageHeight),
         MaskKind.Rectangle => Rectangle.Bounds(imageWidth, imageHeight),
+        MaskKind.Brush => Brush.Bounds(imageWidth, imageHeight),
         _ => Radial.Bounds(imageWidth, imageHeight),
     };
 
@@ -186,6 +193,7 @@ public sealed class MaskSettings
     {
         MaskKind.Linear => Linear.Weights(imageWidth, imageHeight, rect),
         MaskKind.Rectangle => Rectangle.Weights(imageWidth, imageHeight, rect),
+        MaskKind.Brush => Brush.Weights(imageWidth, imageHeight, rect),
         _ => Radial.Weights(imageWidth, imageHeight, rect),
     };
 
@@ -197,6 +205,7 @@ public sealed class MaskSettings
         Radial = Radial.Clone(),
         Linear = Linear.Clone(),
         Rectangle = Rectangle.Clone(),
+        Brush = Brush.Clone(),
         Adjustments = Adjustments.Clone(),
     };
 }
