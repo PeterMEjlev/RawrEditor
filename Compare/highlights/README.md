@@ -4,14 +4,19 @@ How `LocalHighlights`'s amplitude/detail/headroom constants were derived, and ho
 re-derive them. The same method applies to the Blacks / Shadows / Whites / Texture
 datasets.
 
+**Second-generation (two-dataset, scene-adaptive) calibration:** the sections up to
+"Two findings" describe the original 29-scene fit; the **"Scene-adaptive recalibration"**
+section at the bottom describes the shipped model, which supersedes it.
+
 ## The dataset
 
-29 scenes, each exported from Lightroom with **only** the Highlights slider changed:
-`0, ±25, ±50, ±75, ±100` (9 variants × 29 = 261 JPEGs), plus the matching `.CR3` raws.
+Two independently shot batches, each exported from Lightroom with **only** the
+Highlights slider changed: `0, ±25, ±50, ±75, ±100`.
 
 ```
-Datasets/Highlights/<stem>_h{000,+025,…,-100}.jpg   # LR exports, full res, pixel-aligned per scene
-Datasets/Dataset 1/<stem>.CR3                        # the raws (for end-to-end validation)
+Datasets/Dataset 1/Highlights/<stem>_h{000,+025,…,-100}.jpg          # 29 scenes, Canon CR3
+Datasets/Dataset 2/Highlights/<stem>_highlights{000,±…}.jpg          # 30 scenes, CR3+CR2+ARW
+Datasets/Dataset {1,2}/<stem>.{CR3,cr2,ARW}                          # the raws
 ```
 
 ## The idea
@@ -84,7 +89,54 @@ compares to the LR JPEGs.
 
 1. **Neutral baseline gap.** RAWR's default render is ~26 codes RMS (bias ~−8, darker) from
    LR's neutral on this set. That is `BasicTone.LightroomMatch` — fit on a single scene — not
-   generalising. Re-deriving that LUT by CDF-matching these 29 neutral pairs would help every
-   slider and is likely the larger visible win.
-2. **Scene-adaptivity** (above): the ceiling for any local operator; closing it needs a
-   content-adaptive model.
+   generalising. Re-deriving that LUT by CDF-matching the 59 neutral pairs would help every
+   slider and is likely the larger visible win. **Still open.**
+2. **Scene-adaptivity**: solved below.
+
+## Scene-adaptive recalibration (the shipped model)
+
+Adding Dataset 2 exposed that the single-curve model does not generalise: fitted on D1
+it scores 8.5 in-sample but **19.5 held-out on D2** (`fit_holdout.py`) — D2's scenes are
+darker on average, and the −100 pull at matched base spans −0.06 … −5.7 EV across the 59
+scenes. `feature_corr.py` showed this is not noise: the pull correlates **r = +0.94**
+with the scene's overall exposure (robust per-dataset and to outlier removal). LR's
+Highlights has a *global scene input* a purely local operator lacks.
+
+The winning form (`finalize5.py`, evaluated against additive-constant and multiplicative
+alternatives in `joint_model*.py` / `finalize4.py`):
+
+```
+Fd        = fraction of the frame's pixels below −3 EV        (deep-shadow fraction, [0,1])
+amp(B,Fd) = max(A(B) + G(B)·(min(Fd,0.85) − 0.3734), 0) · taper(B)
+A(B)      = 0.3261·1.4526·softplus((B+3.0)/1.4526)            (reference-scene amplitude)
+G(B)      = 0.982 + 1.803·smoothstep(−3.83, +0.32, B)         (Fd-sensitivity, own tone profile)
+taper     = blacks guard, widened to [−6.0, −2.4] EV
+```
+
+Key measurements behind the form:
+- Per-bin regression of the Fd-dependence (`gamma(B)`) is **not constant** — ~1.0 in the
+  deep shadows rising to ~2.9 near middle grey — so the scene term is a second *curve*,
+  not a scale factor or offset.
+- The additive-in-EV form keeps monotonicity verifiable: min d(B−amp)/dB = **+0.21** at
+  −100 across the whole Fd ∈ [0,1] range (the Fd cap and the widened guard ramp are both
+  load-bearing for this; the old [−3.3,−2.4] ramp inverts tone at high Fd).
+- The widened guard also *matches LR better*: dark scenes measurably keep pulling well
+  below −3 EV.
+
+JPEG-domain display-code RMS over all 8 slider levels (do-nothing / old single-curve /
+shipped scene-adaptive): **D1 12.9 / 8.6 / 7.4 — D2 23.5 / 19.7 / 11.0.**
+Generalisation of the scene term was validated D1→D2 before pooling (19.5 → 12.0
+held-out, `joint_model2.py`).
+
+Engine integration: `LocalHighlights.Options.SceneShadowFraction` carries Fd; NaN means
+"measure from the planes given to Apply" (whole-frame callers), while crop renders (1:1
+tiles, mask regions) pin the full-frame value via
+`LocalHighlights.EstimateSceneShadowFraction` — threaded through `DevelopProcessor` as
+`sceneFrame`, the same full-frame-statistic discipline as Dehaze's airlight. The
+statistic is measured on the sensor pixels pre-reconstruction/pre-dehaze, on a
+deterministic subsample grid, so every path measuring the same frame gets the same value.
+
+Reproduce: `python cache_ev2.py` (both datasets → cache/), then `fit_holdout.py`,
+`feature_corr.py`, `finalize5.py` (+ the intermediate `joint_model*.py`, `finalize4.py`
+for the model-selection evidence). Legacy single-dataset scripts (`cache_ev.py`,
+`fit.py`, `ablate.py`, `finalize.py`) still work against the old cache layout.

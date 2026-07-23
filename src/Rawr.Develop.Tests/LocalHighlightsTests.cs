@@ -66,27 +66,39 @@ public class LocalHighlightsTests
         Assert.True(midDrop < brightDrop * 0.1, $"midtone barely moves, mid {midDrop:F5} vs bright {brightDrop:F4}");
     }
 
-    // ── 3. Deep shadows are bit-exact; the upper shadows move only gently ───
+    // ── 3. True blacks are bit-exact; shadows scale with the scene statistic ─
     [Fact]
-    public void DeepShadows_AreExact_UpperShadowsMoveOnlyGently()
+    public void TrueBlacks_AreExact_ShadowResponseScalesWithScene()
     {
         const int w = 24, h = 24, n = w * h;
 
-        // Below BlacksGuardLoEv (~0.018 linear) the amplitude is tapered to exactly 0 and
-        // detailGain is exactly 1, so the log round-trip returns the input bit-for-bit —
-        // deep shadows and blacks are untouched and Highlights never fights Blacks.
-        var (r, g, b) = Uniform(n, 0.01);
+        // Below BlacksGuardLoEv (−6 EV ≈ 0.0028 linear) the amplitude is tapered to
+        // exactly 0 and detailGain is exactly 1, so the log round-trip returns the input
+        // bit-for-bit — true blacks are untouched even in the darkest scene (this frame
+        // is entirely deep shadow, so Fd is at its cap) and Highlights never fights Blacks.
+        var (r, g, b) = Uniform(n, 0.002);
         LocalHighlights.Apply(r, g, b, w, h, new LocalHighlights.Options { Highlights = -100, Radius = 4 });
-        Assert.Equal(0.01, Lum(r[n / 2], g[n / 2], b[n / 2]), 6);
+        Assert.Equal(0.002, Lum(r[n / 2], g[n / 2], b[n / 2]), 6);
 
-        // Just inside the guarded band Lightroom still applies a small floor pull (this is
-        // measured, not incidental), but it must stay gentle — well under an eighth of a
-        // stop — rather than reach these tones the way the highlight band does above.
-        var (r2, g2, b2) = Uniform(n, 0.03);
-        LocalHighlights.Apply(r2, g2, b2, w, h, new LocalHighlights.Options { Highlights = -100, Radius = 4 });
-        double drop = 0.03 - Lum(r2[n / 2], g2[n / 2], b2[n / 2]);
-        Assert.True(drop > 0.0 && drop < 0.03 * 0.12,
-            $"upper-shadow floor pull should be small, drop {drop:F5}");
+        // In a reference-brightness scene (Fd pinned to FdRef so only A(B) applies), an
+        // upper shadow sees just a gentle residual of the taper — well under an eighth
+        // of a stop — rather than the highlight band's full pull.
+        var refOpt = new LocalHighlights.Options { Highlights = -100, Radius = 4 };
+        refOpt.SceneShadowFraction = refOpt.FdRef;
+        var (r2, g2, b2) = Uniform(n, 0.01);
+        LocalHighlights.Apply(r2, g2, b2, w, h, refOpt);
+        double gentle = 0.01 - Lum(r2[n / 2], g2[n / 2], b2[n / 2]);
+        Assert.True(gentle > 0.0 && gentle < 0.01 * 0.12,
+            $"reference-scene upper-shadow pull should be gentle, drop {gentle:F5}");
+
+        // The same tone in a dark scene (Fd self-measured from this all-shadow frame,
+        // landing at the cap) is pulled several times harder — Lightroom's measured
+        // scene-adaptivity, the r≈0.94 correlation the two-dataset calibration found.
+        var (r3, g3, b3) = Uniform(n, 0.01);
+        LocalHighlights.Apply(r3, g3, b3, w, h, new LocalHighlights.Options { Highlights = -100, Radius = 4 });
+        double dark = 0.01 - Lum(r3[n / 2], g3[n / 2], b3[n / 2]);
+        Assert.True(dark > gentle * 2.0,
+            $"a dark scene should pull its shadows harder than the reference scene: {dark:F5} vs {gentle:F5}");
     }
 
     // ── 4. RGB ratios are preserved for nonzero pixels ─────────────────────
@@ -172,11 +184,14 @@ public class LocalHighlightsTests
         int darkInterior = (h / 2) * w + 4;     // deep in the dark half
         int brightInterior = (h / 2) * w + w - 5; // deep in the bright half
 
-        // 0.04 linear sees only the ~0.14 EV floor and lands at ~0.036; a halo from the
-        // bright edge would deepen the base and drag it well below this window.
+        // This frame reads as brighter than the reference scene (no deep shadows, so
+        // Fd = 0), where the fitted amplitude at an upper-shadow base crosses zero and
+        // clamps: the dark interior is left alone entirely. A halo from the bright edge
+        // would raise the dark region's base past the clamp point and pull it down —
+        // so a tight window around the input still catches base-layer bleed.
         double dark = Lum(r[darkInterior], g[darkInterior], b[darkInterior]);
-        Assert.True(dark > 0.034 && dark < 0.039,
-            $"dark interior should see only the floor pull, not a halo, got {dark:F4}");
+        Assert.True(dark > 0.0398 && dark < 0.0402,
+            $"dark interior should be untouched (amp clamps at 0 in a bright scene), got {dark:F4}");
         Assert.True(Lum(r[brightInterior], g[brightInterior], b[brightInterior]) < 1.0,
             $"bright interior should be recovered below the clip, got {Lum(r[brightInterior], g[brightInterior], b[brightInterior]):F4}");
     }

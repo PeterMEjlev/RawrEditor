@@ -12,3 +12,11 @@ dist/
 # OS/editor noise
 Thumbs.db
 Desktop.ini
+
+# Python calibration scratch — all regenerable from the raws via the
+# Compare/*/ scripts (cache_ev*.py rebuilds the EV cache; finalize*.py the fits).
+# The decoded EV cache alone is ~7 GB, so it must never enter git history.
+__pycache__/
+*.pyc
+*.npz
+Compare/**/cache/

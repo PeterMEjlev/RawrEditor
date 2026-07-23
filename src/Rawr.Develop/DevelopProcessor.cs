@@ -221,7 +221,8 @@ public static class DevelopProcessor
         if (s.Dehaze != 0.0)
             airlight = Effects.EstimateAirlightFromSensor(developed.Pixels, fw, fh);
 
-        var (_, _, r, g, b) = RenderRgbPlanes(region, tone, po, ct, fw, fh, ref airlight);
+        var (_, _, r, g, b) = RenderRgbPlanes(region, tone, po, ct, fw, fh, ref airlight,
+                                              sceneFrame: developed);
 
         ComposeMasksRegion(developed, s, r, g, b, px0, py0, padW, padH, po, ct, airlight);
 
@@ -486,9 +487,9 @@ public static class DevelopProcessor
     private static (int w, int h, float[] r, float[] g, float[] b)
         RenderRgbPlanes(LinearRawImage raw, DevelopSettings s, ParallelOptions po,
                         CancellationToken ct, int contextW, int contextH,
-                        ref Effects.Airlight? airlight)
+                        ref Effects.Airlight? airlight, LinearRawImage? sceneFrame = null)
     {
-        var (w, h, luma, cb, cr) = DecomposeToPlanes(raw, s, po, ct, contextW, contextH, ref airlight);
+        var (w, h, luma, cb, cr) = DecomposeToPlanes(raw, s, po, ct, contextW, contextH, ref airlight, sceneFrame);
 
         // ── Colour scale: baseline pop + Saturation + chroma-aware Vibrance ──
         var presence = Presence.Build(s.Vibrance, s.Saturation);
@@ -645,7 +646,8 @@ public static class DevelopProcessor
             masked.Geometry = new GeometrySettings();
 
             var regionAirlight = airlight;
-            var (_, _, mr, mg, mb) = RenderRgbPlanes(region, masked, po, ct, w, h, ref regionAirlight);
+            var (_, _, mr, mg, mb) = RenderRgbPlanes(region, masked, po, ct, w, h,
+                                                     ref regionAirlight, sceneFrame: raw);
             var weights = mask.Weights(w, h, area);
 
             Parallel.For(0, area.Height, po, row =>
@@ -806,7 +808,8 @@ public static class DevelopProcessor
             masked.Geometry = new GeometrySettings();
 
             var maskAir = airlight;
-            var (_, _, mr, mg, mb) = RenderRgbPlanes(mregion, masked, po, ct, fw, fh, ref maskAir);
+            var (_, _, mr, mg, mb) = RenderRgbPlanes(mregion, masked, po, ct, fw, fh,
+                                                     ref maskAir, sceneFrame: developed);
             var weights = mask.Weights(fw, fh, area);
 
             Parallel.For(ay0, ay1, po, row =>
@@ -841,7 +844,7 @@ public static class DevelopProcessor
     private static (int w, int h, float[] luma, float[] cb, float[] cr)
         DecomposeToPlanes(LinearRawImage raw, DevelopSettings s, ParallelOptions po,
                           CancellationToken ct, int contextW, int contextH,
-                          ref Effects.Airlight? airlight)
+                          ref Effects.Airlight? airlight, LinearRawImage? sceneFrame = null)
     {
         int w = raw.Width;
         int h = raw.Height;
@@ -981,12 +984,26 @@ public static class DevelopProcessor
             }
 
             if (doLocalHighlights)
+            {
+                // Lightroom's Highlights response scales with how dark the photograph
+                // is overall (see LocalHighlights.Options.SceneShadowFraction), so the
+                // statistic must come from the whole frame — sceneFrame when this
+                // buffer is a crop — under this render's own gains. Measured on the
+                // sensor pixels (pre-reconstruction, pre-dehaze): reconstruction only
+                // touches near-clip pixels the deep-shadow count never sees, and
+                // keying it pre-dehaze means dragging Dehaze cannot jump the
+                // Highlights response.
+                var frame = sceneFrame ?? raw;
+                double fd = LocalHighlights.EstimateSceneShadowFraction(
+                    frame.Pixels, frame.Width, frame.Height, gainR, gainG, gainB);
                 LocalHighlights.Apply(rLin, gLin, bLin, w, h,
                     new LocalHighlights.Options
                     {
                         Highlights = hl,
                         Radius = LocalHighlights.RegionRadius(contextW, contextH),
+                        SceneShadowFraction = fd,
                     }, po);
+            }
         }
 
         // ── Pass 0 (conditional): regional luminance plane for v3 sliders ──

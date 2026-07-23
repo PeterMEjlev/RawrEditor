@@ -218,8 +218,13 @@ public class ExposureAndWhitesTests
         int c = 32 * w + 32;
 
         // Highlights reads the region, finds it dark, and barely touches the speck.
+        // The scene statistic is pinned to the reference so this exercises the
+        // regional character alone — an all-dark synthetic frame would otherwise read
+        // as a night scene, where Lightroom's measured response is strong everywhere.
+        var hOpt = new LocalHighlights.Options { Highlights = -100 };
+        hOpt.SceneShadowFraction = hOpt.FdRef;
         var hr = (float[])r.Clone(); var hg = (float[])g.Clone(); var hb = (float[])b.Clone();
-        LocalHighlights.Apply(hr, hg, hb, w, h, new LocalHighlights.Options { Highlights = -100 });
+        LocalHighlights.Apply(hr, hg, hb, w, h, hOpt);
 
         // Whites has no region to consult and moves it like any other bright pixel.
         double wr2 = r[c], wg2 = g[c], wb2 = b[c];
@@ -228,8 +233,13 @@ public class ExposureAndWhitesTests
         double highlightsDrop = Display8(1.0) - Display8(hr[c]);
         double whitesDrop = Display8(1.0) - Display8(wr2);
 
-        Assert.True(whitesDrop > highlightsDrop * 2.0,
-            $"Whites should move an isolated specular far more than Highlights does: " +
+        // The margin is 1.4×, not the 2× the pre-scene-adaptive calibration allowed: the
+        // two-dataset recalibration strengthened the amplitude on bright bases, and the
+        // single-scale guided base treats a hard-edged speck as its own small region, so
+        // Highlights moves it more than it once did. The character difference — global
+        // versus regional — is what this test pins, and it survives.
+        Assert.True(whitesDrop > highlightsDrop * 1.4,
+            $"Whites should move an isolated specular clearly more than Highlights does: " +
             $"{whitesDrop:F1} vs {highlightsDrop:F1}");
     }
 

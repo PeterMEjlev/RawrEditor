@@ -45,19 +45,24 @@ namespace Rawr.Develop;
 /// approximately so; and at slider 0 (k = 0) the whole frame is.</para>
 ///
 /// <para><b>Calibration.</b> The amplitude and detail curves are fitted to Lightroom
-/// across 261 exports — 29 scenes × Highlights 0 / ±25 / ±50 / ±75 / ±100 — by inverting
-/// this pipeline's output transform on each export to scene-linear luminance EV (the
-/// operator's own space), guided-filtering the neutral to a regional base B, and binning
-/// ΔEV against B over ~18 M unclipped pixels per level. Three findings shaped the model:
-/// the response is <i>linear in the slider</i> (one k scale is exact); it is
-/// <i>near-symmetric</i> between recovery and boost up to the clip (one amplitude curve,
-/// signed by direction); and it <i>does not saturate</i> — Lightroom pulls harder the
-/// brighter the region, ~0.54 EV at middle grey (190/255) rising past 0.88 EV near white,
-/// where the previous smoothstep band flattened out at +0.6 EV. Fitting the softplus
-/// reproduces the binned curve to ~0.02 EV and, across the whole set, cuts the residual
-/// against Lightroom from the do-nothing 12.9 to 8.6 code values (the previous band +
-/// soft-knee model scored 8.9), improving every slider level. The analysis scripts live
-/// under Compare/highlights.</para>
+/// across 531 exports — 59 scenes × Highlights 0 / ±25 / ±50 / ±75 / ±100, two
+/// independently-shot datasets (Canon CR3/CR2 + Sony ARW) — by inverting this pipeline's
+/// output transform on each export to scene-linear luminance EV (the operator's own
+/// space), guided-filtering the neutral to a regional base B, and binning ΔEV against B.
+/// Four findings shape the model: the response is <i>linear in the slider</i> (one k
+/// scale is exact); it is <i>near-symmetric</i> between recovery and boost up to the clip
+/// (one amplitude curve, signed by direction); it <i>does not saturate</i> — Lightroom
+/// pulls harder the brighter the region; and — the decisive one — it is <i>strongly
+/// scene-adaptive</i>: at the same regional base, the −100 pull spans −0.06 to −5.7 EV
+/// across scenes, correlating r ≈ +0.94 with the scene's overall exposure. Per-tone-bin
+/// regression shows the scene term is a second <i>curve</i>, not a constant: the
+/// Fd-sensitivity G(B) has a deep-shadow floor (~1.0) rising to a highlight plateau
+/// (~2.8). Hence the two-curve amplitude in <see cref="Options.AmpFloor"/> ff., driven by
+/// the frame statistic Fd = fraction of pixels darker than −3 EV (see
+/// <see cref="Options.SceneShadowFraction"/>). Fitted on dataset 1 alone, the scene term
+/// generalises to the unseen dataset 2 (held-out display-code RMS 19.5 → 12.0); the
+/// shipped pooled fit scores 7.4 (D1) / 11.0 (D2) vs the scene-blind model's 8.6 / 19.7
+/// and do-nothing's 12.9 / 23.5. The analysis scripts live under Compare/highlights.</para>
 ///
 /// <para><b>Headroom above display white.</b> Base tones the 8-bit exports clip at (above
 /// ~+1.6 EV / 250-255) are invisible to the fit, yet recovering blown highlights into view
@@ -95,59 +100,99 @@ public static class LocalHighlights
         /// the same at preview and full-resolution sizes.</summary>
         public int Radius = 0;
 
-        // ── Base-offset amplitude: a softplus in EV, fitted to Lightroom ───────
+        // ── Base-offset amplitude: two fitted curves in EV, driven by a frame statistic ──
         //
         // The signed EV the regional base is moved by at |slider| = 100 is
         //
-        //     Amp(baseEv) = (AmpFloor + AmpSlope·AmpWidthEv·softplus((baseEv−AmpKneeEv)/AmpWidthEv))
-        //                   · smoothstep(BlacksGuardLoEv, BlacksGuardHiEv, baseEv)
+        //     amp(baseEv, Fd) = max(A(baseEv) + G(baseEv)·(min(Fd, FdCap) − FdRef), 0)
+        //                       · smoothstep(BlacksGuardLoEv, BlacksGuardHiEv, baseEv)
+        //     A(baseEv) = AmpFloor + AmpSlope·AmpWidthEv·softplus((baseEv−AmpKneeEv)/AmpWidthEv)
+        //     G(baseEv) = FdGainLo + (FdGainHi−FdGainLo)·smoothstep(FdGainLoEv, FdGainHiEv, baseEv)
         //
         // (softplus(x) = ln(1+eˣ)), applied downward on recovery and upward on boost.
-        // It is a floor of ~0.13 EV that rises smoothly through the highlight band —
-        // ~0.26 EV at 140/255, ~0.54 at middle grey (190/255), ~0.76 at 234/255 —
-        // and, unlike a smoothstep band, never saturates: it keeps steepening into the
-        // brightest tones, which is what Lightroom's Highlights actually does. The
-        // asymptotic slope is AmpSlope ≈ 0.25 < 1, so B ↦ B − Amp(B) stays strictly
-        // increasing at −100 (no tone inversion) and the linear tail folds recovered
-        // above-white headroom monotonically into view — subsuming the old two-stage
-        // band-plus-soft-knee arrangement.
+        // A(B) is the response for the reference scene (Fd = FdRef): it rises smoothly
+        // and never saturates — Lightroom keeps pulling harder into the brightest tones.
         //
-        // <b>Calibrated from 261 exports.</b> 29 scenes, each exported from Lightroom at
-        // Highlights 0 / ±25 / ±50 / ±75 / ±100. Each export's output transform was
-        // inverted (DisplayCurve∘LightroomMatch) to scene-linear luminance EV — the very
-        // space this operator works in — the neutral guided-filtered to a regional base
-        // B, and ΔEV binned against B over ~18 M unclipped pixels per level. The measured
-        // response is linear in the slider (so a single k = |slider|/100 scale is exact)
-        // and near-symmetric between recovery and boost up to the clip, so one amplitude
-        // curve serves both directions. A softplus fit reproduces the binned curve to
-        // within ~0.02 EV across the high-density band; on held-out scenes it beats a raw
-        // per-bin LUT, so it is not over-fitted. See Compare/highlights (analysis scripts).
+        // G(B) is what makes the operator match Lightroom where a scene-blind curve
+        // cannot: at the SAME regional base, Lightroom's −100 pull spans −0.06 EV in a
+        // bright scene to −5.7 EV in a near-black one (r ≈ +0.94 against overall scene
+        // exposure across 59 scenes — not noise, a missing input). The per-tone-bin
+        // regression of that dependence is itself tone-dependent — ~1.0 EV/unit-Fd in the
+        // deep shadows rising to ~2.8 around middle grey — hence a second curve rather
+        // than one scale factor. Fd is the fraction of the frame darker than −3 EV
+        // (see SceneShadowFraction below); dark scenes (Fd high) get a stronger response,
+        // bright scenes a gentler one, exactly as measured. The max(·, 0) clamp keeps the
+        // direction honest in very bright scenes where the fitted term would cross zero.
+        //
+        // Monotonicity at −100 (no tone inversion) is verified numerically across the
+        // whole possible Fd range in the calibration scripts: min d(B−amp)/dB = +0.21
+        // with the FdCap and the widened blacks-guard ramp below. See
+        // Compare/highlights/finalize5.py (fit + safety check) and README.
 
-        /// <summary>Amplitude floor in EV — the gentle pull Lightroom keeps even in the
-        /// low midtones (~0.13 EV at |slider| = 100).</summary>
-        public double AmpFloor = 0.1294;
+        /// <summary>Reference-scene amplitude floor in EV (A(B)'s softplus floor; the fit
+        /// landed at 0 — deep-shadow response comes from the Fd term instead).</summary>
+        public double AmpFloor = 0.0;
 
-        /// <summary>Asymptotic EV-per-EV slope of the amplitude in the bright tones.
-        /// Kept below 1 so recovery never inverts tone ordering.</summary>
-        public double AmpSlope = 0.2536;
+        /// <summary>Asymptotic EV-per-EV slope of A(B) in the bright tones. Kept below 1
+        /// so recovery never inverts tone ordering at the reference Fd.</summary>
+        public double AmpSlope = 0.3261;
 
-        /// <summary>Softplus knee, in stops about middle grey: where the highlight band
-        /// starts rising above the floor (≈ −1.44 EV ≈ 113/255).</summary>
-        public double AmpKneeEv = -1.4381;
+        /// <summary>Softplus knee of A(B), in stops about middle grey.</summary>
+        public double AmpKneeEv = -3.0;
 
-        /// <summary>Softplus width in EV — how sharply the band turns on at the knee.</summary>
-        public double AmpWidthEv = 0.3209;
+        /// <summary>Softplus width of A(B) in EV.</summary>
+        public double AmpWidthEv = 1.4526;
+
+        /// <summary>Fd-sensitivity G(B) in the deep shadows (EV per unit of Fd).</summary>
+        public double FdGainLo = 0.9820;
+
+        /// <summary>Fd-sensitivity G(B) at its midtone/highlight plateau.</summary>
+        public double FdGainHi = 2.7851;
+
+        /// <summary>Where G(B) starts rising from its shadow floor, in stops about middle grey.</summary>
+        public double FdGainLoEv = -3.8287;
+
+        /// <summary>Where G(B) reaches its plateau, in stops about middle grey.</summary>
+        public double FdGainHiEv = 0.3197;
+
+        /// <summary>The reference scene's deep-shadow fraction — the Fd at which the
+        /// scene term vanishes and A(B) alone applies (the pooled dataset mean).</summary>
+        public double FdRef = 0.3734;
+
+        /// <summary>Fd is clamped here before use. The two calibration scenes above this
+        /// were near-black frames whose measured pulls (−5.5 EV) even the full per-bin
+        /// model could not track; capping keeps the recovery map comfortably monotonic
+        /// (margin verified across Fd ∈ [0,1]) at a negligible RMS cost.</summary>
+        public double FdCap = 0.85;
+
+        /// <summary>Threshold defining Fd: the fraction of the frame's pixels whose
+        /// luminance EV about middle grey is below this. −3 EV ≈ 30/255.</summary>
+        public double FdThresholdEv = -3.0;
+
+        /// <summary>
+        /// The frame's deep-shadow fraction Fd ∈ [0,1] — the scene statistic driving
+        /// G(B). NaN (the default) means "measure it from the planes handed to
+        /// <see cref="Apply"/>", which is correct when those planes are the whole frame.
+        /// A caller rendering a <i>crop</i> (a viewport tile, a mask region) must pin the
+        /// full-frame value instead — a fragment's own statistic would differ from the
+        /// frame's and the difference shows up as a seam or a preview/tile mismatch, the
+        /// same trap <see cref="RegionRadius"/> and Dehaze's airlight already document.
+        /// Compute it with <see cref="EstimateSceneShadowFraction"/>.
+        /// </summary>
+        public double SceneShadowFraction = double.NaN;
 
         /// <summary>
         /// Below <see cref="BlacksGuardHiEv"/> the amplitude is tapered to 0, reaching an
-        /// exact no-op at and below <see cref="BlacksGuardLoEv"/>, so deep shadows and
-        /// blacks stay bit-exact untouched and Highlights never fights the Blacks slider.
+        /// exact no-op at and below <see cref="BlacksGuardLoEv"/>, so true blacks stay
+        /// bit-exact untouched.
         ///
-        /// <para>Lightroom does apply a small (~0.13 EV) pull even this far down; dropping
-        /// it here costs only ~0.05 code values of match — imperceptible — and buys a clean
-        /// shadow no-op, the same property the previous anchor prized.</para>
+        /// <para>The ramp is deliberately long (−6 → −2.4 EV). Lightroom measurably keeps
+        /// pulling well below −3 EV in dark scenes — the old cutoff at −3.3 was fighting
+        /// the data — and a short ramp under the enlarged dark-scene amplitude would put
+        /// the taper's slope over 1 and invert tone ordering; the long ramp is both the
+        /// better match and the safe one.</para>
         /// </summary>
-        public double BlacksGuardLoEv = -3.3;
+        public double BlacksGuardLoEv = -6.0;
 
         /// <summary>Top of the blacks-guard taper, in stops about middle grey (≈ 66/255).</summary>
         public double BlacksGuardHiEv = -2.4;
@@ -213,21 +258,25 @@ public static class LocalHighlights
 
     /// <summary>
     /// The signed-magnitude EV the regional base is moved by at |slider| = 100, from a
-    /// base (region) tone in EV — Lightroom's measured Highlights response (see the note
-    /// on <see cref="Options.AmpFloor"/>). A softplus that floors near <c>AmpFloor</c> and
-    /// rises monotonically through the highlights, tapered to an exact 0 in the blacks.
+    /// base (region) tone in EV and the frame's centred deep-shadow term
+    /// (<paramref name="fdDelta"/> = clamped Fd − FdRef) — Lightroom's measured
+    /// scene-adaptive Highlights response (see the note on <see cref="Options.AmpFloor"/>).
     ///
     /// <para>Returns ≥ 0; the caller applies the sign (down on recovery, up on boost).
     /// Exactly 0 at and below <see cref="Options.BlacksGuardLoEv"/>, so the operator is a
-    /// bit-exact no-op on deep shadows there, and (via k) for a neutral slider.</para>
+    /// bit-exact no-op on true blacks there, and (via k) for a neutral slider.</para>
     /// </summary>
-    private static double HighlightAmplitude(double baseEv, Options o)
+    private static double HighlightAmplitude(double baseEv, double fdDelta, Options o)
     {
         double t = (baseEv - o.BlacksGuardLoEv) / (o.BlacksGuardHiEv - o.BlacksGuardLoEv);
         if (t <= 0.0) return 0.0;
         if (t > 1.0) t = 1.0;
-        double sp = Softplus((baseEv - o.AmpKneeEv) / o.AmpWidthEv);
-        return (o.AmpFloor + o.AmpSlope * o.AmpWidthEv * sp) * t;
+        double a = o.AmpFloor + o.AmpSlope * o.AmpWidthEv
+                 * Softplus((baseEv - o.AmpKneeEv) / o.AmpWidthEv);
+        double g = o.FdGainLo + (o.FdGainHi - o.FdGainLo)
+                 * BasicTone.SmoothStep(o.FdGainLoEv, o.FdGainHiEv, baseEv);
+        double amp = a + g * fdDelta;
+        return amp > 0.0 ? amp * t : 0.0;
     }
 
     /// <summary>Detail-layer gain magnitude at |slider| = 100 from a base tone in EV:
@@ -245,6 +294,44 @@ public static class LocalHighlights
     /// outside, and the difference shows up as a seam at the mask edge.
     /// </summary>
     public static int RegionRadius(int w, int h) => Math.Clamp(Math.Min(w, h) / 16, 16, 64);
+
+    /// <summary>
+    /// The frame's deep-shadow fraction Fd from the un-gained sensor pixels and the
+    /// render's per-channel gains — for callers that render a <i>crop</i> and must pin
+    /// <see cref="Options.SceneShadowFraction"/> to the whole frame's value (the same
+    /// full-frame-statistic discipline as Dehaze's airlight). Counts the fraction of
+    /// pixels whose gained scene-linear luminance sits below
+    /// <see cref="Options.FdThresholdEv"/> stops about middle grey.
+    /// </summary>
+    public static double EstimateSceneShadowFraction(ushort[] sensor, int w, int h,
+                                                     double gainR, double gainG, double gainB,
+                                                     double thresholdEv = -3.0)
+    {
+        if (w <= 0 || h <= 0 || sensor.Length < (long)w * h * 3) return double.NaN;
+        // Subsample on a fixed grid: the fraction is taken over millions of pixels, so
+        // a ~1M-sample grid estimates it to well under measurement noise, and because
+        // the stride is a pure function of the frame size, every render path measuring
+        // the same frame (tile, mask crop, export) computes the identical value — no
+        // preview/tile seams from the statistic itself.
+        int step = Math.Max(1, Math.Min(w, h) / 1024);
+        // I < thr  ⇔  Y < midGray·2^thr — one comparison in linear, no log per sample.
+        double yThr = BasicTone.MiddleGray * Math.Pow(2.0, thresholdEv) * 65535.0;
+        long dark = 0, total = 0;
+        for (int yy = 0; yy < h; yy += step)
+        {
+            long p = (long)yy * w * 3;
+            long pStep = 3L * step;
+            for (int x = 0; x < w; x += step, p += pStep)
+            {
+                double y = BasicTone.Luminance(sensor[p] * gainR,
+                                               sensor[p + 1] * gainG,
+                                               sensor[p + 2] * gainB);
+                if (y < yThr) dark++;
+                total++;
+            }
+        }
+        return (double)dark / total;
+    }
 
     /// <summary>
     /// Apply the Highlights adjustment in place to planar linear-RGB float buffers
@@ -289,7 +376,23 @@ public static class LocalHighlights
         var B = new float[n];
         GuidedBase(I, B, w, h, radius, (float)options.GuidedEpsilon, po);
 
-        // ── 3. Slider → base offset and detail gain ──
+        // ── 3. Scene statistic: the frame's deep-shadow fraction ──
+        // Lightroom's Highlights is scene-adaptive (see Options.AmpFloor): the same
+        // regional base gets a stronger response in a dark frame than a bright one.
+        // Measured from the I plane unless the caller pinned the full-frame value
+        // (crops must — see Options.SceneShadowFraction).
+        double fd = options.SceneShadowFraction;
+        if (double.IsNaN(fd))
+        {
+            long dark = 0;
+            double thr = options.FdThresholdEv;
+            for (int i = 0; i < n; i++)
+                if (I[i] < thr) dark++;
+            fd = (double)dark / n;
+        }
+        double fdDelta = Math.Clamp(fd, 0.0, options.FdCap) - options.FdRef;
+
+        // ── 4. Slider → base offset and detail gain ──
         // Linear in the slider: the measured ±25/±50/±75 exports land at exactly
         // 0.25/0.50/0.75 of the ±100 response in EV, so a straight k scale is the
         // correct parameterisation. dir points the offset (down on recovery, up on
@@ -307,13 +410,13 @@ public static class LocalHighlights
                 double Bi = B[i];
                 double Di = Ii - Bi;
 
-                // ── 4a. Offset the base by the calibrated amplitude. ──
+                // ── 5a. Offset the base by the calibrated amplitude. ──
                 // A monotone softplus in EV: no false saturation in the highlights, and a
                 // sub-unity tail that keeps recovery order-preserving.
-                double amp = HighlightAmplitude(Bi, options);
+                double amp = HighlightAmplitude(Bi, fdDelta, options);
                 double Bo = Bi + dir * k * amp;
 
-                // ── 4b. Fold the headroom above the calibrated band (recovery only). ──
+                // ── 5b. Fold the headroom above the calibrated band (recovery only). ──
                 // Identity across the whole calibrated range (its knee sits above the band's
                 // own output) and at neutral (foldSlope == 1 ⇒ SoftKnee is the identity), so
                 // it cannot disturb the calibration or the no-op — it only pulls above-white
@@ -325,13 +428,13 @@ public static class LocalHighlights
                        + BasicTone.SoftKnee(Bo - options.HeadroomKneeEv, foldSlope, options.HeadroomWidthEv);
                 }
 
-                // ── 4c. Detail layer: expand on recovery, compress on boost. ──
+                // ── 5c. Detail layer: expand on recovery, compress on boost. ──
                 // 1 at neutral (k = 0) and below the band (weight 0), so the no-op holds.
                 double detailGain = 1.0 - dir * k * DetailWeight(Bi, options);
 
                 double Io = Bo + detailGain * Di;
 
-                // ── 5. Back to linear luminance, colour via a single gain. ──
+                // ── 6. Back to linear luminance, colour via a single gain. ──
                 double y2 = midGray * double.Exp2(Io) - eps;
 
                 double y0 = Y[i];
